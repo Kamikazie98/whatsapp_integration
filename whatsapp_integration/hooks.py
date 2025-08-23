@@ -28,6 +28,41 @@ app_license = "mit"
 # app_include_css = "/assets/whatsapp_integration/css/whatsapp_integration.css"
 # app_include_js = "/assets/whatsapp_integration/js/whatsapp_integration.js"
 
+# Scheduler Events
+# ----------------
+
+scheduler_events = {
+    "cron": {
+        # Check scheduled campaigns every 1 minute
+        "* * * * *": [
+            "whatsapp_integration.api.campaign.check_scheduled_campaigns",
+            "whatsapp_integration.api.campaign.check_recurring_campaigns"
+        ],
+        # Retry failed messages every 15 minutes
+        "*/15 * * * *": [
+            "whatsapp_integration.api.campaign.auto_retry_failed"
+        ]
+    }
+}
+
+# Document Events
+# ---------------
+
+doc_events = {
+    "WhatsApp Campaign": {
+        "after_insert": "whatsapp_integration.api.campaign.update_campaign_stats",
+        "on_update": "whatsapp_integration.api.campaign.update_campaign_stats"
+    }
+}
+
+# Override Whitelisted Methods
+# ----------------------------
+
+override_whitelisted_methods = {
+    "whatsapp_integration.api.webhook.receive_message": 
+    "whatsapp_integration.api.webhook.receive_message"
+}
+
 # include js, css files in header of web template
 # web_include_css = "/assets/whatsapp_integration/css/whatsapp_integration.css"
 # web_include_js = "/assets/whatsapp_integration/js/whatsapp_integration.js"
@@ -121,6 +156,16 @@ app_license = "mit"
 # 	"Event": "frappe.desk.doctype.event.event.get_permission_query_conditions",
 # }
 #
+
+# Automatically install Python dependencies on app install
+import os
+def after_install():
+    req_path = os.path.join(os.path.dirname(__file__), '..', 'requirements.txt')
+    req_path = os.path.abspath(req_path)
+    if os.path.exists(req_path):
+        os.system(f"pip install -r '{req_path}'")
+
+after_install = after_install
 # has_permission = {
 # 	"Event": "frappe.desk.doctype.event.event.has_permission",
 # }
@@ -241,4 +286,15 @@ app_license = "mit"
 # default_log_clearing_doctypes = {
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
+
+# Custom bench commands
+# ---------------------
+
+commands = [
+	{
+		"name": "start-whatsapp-service",
+		"description": "Start the NodeJS WhatsApp service with auto-detected Frappe port",
+		"module": "whatsapp_integration.commands.whatsapp_service"
+	}
+]
 

@@ -1,19 +1,81 @@
-### Whatsapp Integration
+# WhatsApp Integration for ERPNext
 
-whatsapp_integration
+A complete WhatsApp messaging and campaign management solution for ERPNext/Frappe, supporting both Official WhatsApp Business API and Unofficial WhatsApp Web integration.
 
-### Installation
+## Features
+- Dual mode: Official (Meta Cloud API) and Unofficial (WhatsApp Web)
+- Bulk messaging, campaign management, automation, and more
 
-You can install this app using the [bench](https://github.com/frappe/bench) CLI:
+## Installation
+
+### 1. Install App in Frappe/ERPNext
 
 ```bash
-cd $PATH_TO_YOUR_BENCH
+cd /path/to/your/bench
 bench get-app $URL_OF_THIS_REPO --branch develop
-bench install-app whatsapp_integration
+bench --site <yoursite> install-app whatsapp_integration
 ```
 
-### Contributing
+### 2. Install Python Dependencies
 
+From the app directory:
+
+```bash
+cd apps/whatsapp_integration
+pip install -r requirements.txt
+```
+
+### 3. Install Node.js Service Dependencies
+
+From the Node.js service directory:
+
+```bash
+cd nodejs-whatsapp-service
+npm install
+```
+
+### 4. Start Node.js WhatsApp Service
+
+```bash
+cd nodejs-whatsapp-service
+npm start
+```
+
+Or, for development with auto-reload:
+
+```bash
+npm run dev
+```
+
+### 5. Start Frappe/ERPNext Bench
+
+```bash
+cd /path/to/your/bench
+bench start
+```
+
+## Usage
+- Go to the WhatsApp Device DocType in ERPNext
+- Click "Generate QR Code" and scan with WhatsApp mobile app
+- Follow on-screen instructions for linking and troubleshooting
+
+## Troubleshooting
+- If you see "Can't link new devices at this time", wait 2-5 minutes and try again
+- Remove old linked devices from WhatsApp mobile app
+- Always generate a fresh QR code for each attempt
+
+## Requirements
+
+### Python
+- Python 3.10+
+- Frappe/ERPNext 15+
+- See `requirements.txt` for all Python dependencies
+
+### Node.js
+- Node.js 18+
+- See `nodejs-whatsapp-service/package.json` for all Node.js dependencies
+
+## Contributing
 This app uses `pre-commit` for code formatting and linting. Please [install pre-commit](https://pre-commit.com/#installation) and enable it for this repository:
 
 ```bash
@@ -21,21 +83,8 @@ cd apps/whatsapp_integration
 pre-commit install
 ```
 
-Pre-commit is configured to use the following tools for checking and formatting your code:
+## License
+MIT
 
-- ruff
-- eslint
-- prettier
-- pyupgrade
-
-### CI
-
-This app can use GitHub Actions for CI. The following workflows are configured:
-
-- CI: Installs this app and runs unit tests on every push to `develop` branch.
-- Linters: Runs [Frappe Semgrep Rules](https://github.com/frappe/semgrep-rules) and [pip-audit](https://pypi.org/project/pip-audit/) on every pull request.
-
-
-### License
-
-mit
+---
+For more details, see the full documentation and troubleshooting guides in this repository.
