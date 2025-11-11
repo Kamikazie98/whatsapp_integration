@@ -16,16 +16,26 @@ import tempfile
 
 @frappe.whitelist()
 def generate_quick_qr(session_id):
-    """Generate QR code quickly without session persistence"""
+    """Generate QR code quickly with session persistence.
+
+    Uses a persistent user-data-dir so if the user scans, the login persists
+    and can be detected later by the persistent service.
+    """
     try:
-        # Set up Chrome options (no session persistence)
+        # Set up Chrome options (with session persistence)
         chrome_options = Options()
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--window-size=1280,720")
-        chrome_options.add_argument("--incognito")  # Use incognito mode
+        # Use persistent profile directory
+        try:
+            from whatsapp_integration.api.whatsapp_real_qr import get_session_directory
+            session_dir = get_session_directory(session_id)
+            chrome_options.add_argument(f"--user-data-dir={session_dir}")
+        except Exception:
+            pass
         
         # Create driver
         service = ChromeService(ChromeDriverManager().install())
@@ -101,7 +111,10 @@ def generate_quick_qr(session_id):
             }
             
         finally:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
             
     except Exception as e:
         frappe.log_error(f"Quick QR Error: {str(e)}", "WhatsApp Quick QR")

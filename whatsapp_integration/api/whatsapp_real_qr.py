@@ -691,32 +691,92 @@ def check_qr_status(session_id):
     """Check status of QR generation and return latest QR if available"""
     if session_id in active_qr_sessions:
         session_data = active_qr_sessions[session_id].copy()
-        
-        # If QR is ready and we have a driver, try to get the latest QR
         if session_data.get('status') == 'qr_ready' and session_id in active_drivers:
             try:
                 driver = active_drivers[session_id]
-                # Try to get latest QR from page (non-blocking check)
                 qr_elements = driver.find_elements(By.CSS_SELECTOR, '[data-ref] canvas')
                 if qr_elements and len(qr_elements) > 0:
                     latest_qr = _extract_qr_from_canvas(driver, qr_elements[0])
                     if latest_qr:
-                        # Check if QR has actually changed
                         current_hash = _get_qr_hash(latest_qr)
                         old_hash = _get_qr_hash(session_data.get('qr_data'))
                         if current_hash != old_hash:
-                            # QR has changed, update session
                             session_data['qr_data'] = latest_qr
                             session_data['generated_at'] = time.time()
                             active_qr_sessions[session_id] = session_data
-            except Exception as e:
-                # If we can't get latest QR, return cached one
-                # Don't log as error since this is a frequent check
+            except Exception:
                 pass
-        
         return session_data
-    else:
+    # Try to bootstrap status from persisted profile if not found in memory
+    boot = _bootstrap_session_status(session_id)
+    if boot:
+        return boot
+    return {'status': 'not_found'}
+
+def _bootstrap_session_status(session_id):
+    """Attempt to determine session status by starting Chrome with persisted profile."""
+    try:
+        session_dir = get_session_directory(session_id)
+        chrome_options = _build_chrome_options(user_data_dir=session_dir)
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.get("https://web.whatsapp.com")
+        time.sleep(2)
+        try:
+            candidates = driver.find_elements(By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side']")
+            if candidates and len(candidates) > 0:
+                active_drivers[session_id] = driver
+                active_qr_sessions[session_id] = {
+                    'status': 'connected',
+                    'connected_at': time.time(),
+                    'driver_active': True,
+                    'session_dir': session_dir,
+                }
+                # Start keep-alive
+                try:
+                    t = threading.Thread(target=_keep_session_alive, args=(driver, session_id, session_dir))
+                    t.daemon = True
+                    t.start()
+                except Exception:
+                    pass
+                return active_qr_sessions[session_id].copy()
+        except Exception:
+            pass
+        # Not connected; check QR element
+        try:
+            qr_el = None
+            selectors = ['[data-ref] canvas', 'canvas[aria-label*="QR"]', 'div[data-ref] canvas', 'canvas']
+            for sel in selectors:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                if els and len(els) > 0:
+                    for el in els:
+                        size = el.size
+                        if size.get('width', 0) > 200 and size.get('height', 0) > 200:
+                            qr_el = el
+                            break
+                if qr_el:
+                    break
+            if qr_el:
+                qr_data_url = _extract_qr_from_canvas(driver, qr_el)
+                active_drivers[session_id] = driver
+                active_qr_sessions[session_id] = {
+                    'status': 'qr_ready',
+                    'qr_data': qr_data_url,
+                    'generated_at': time.time(),
+                    'driver_active': True,
+                    'session_dir': session_dir,
+                }
+                return active_qr_sessions[session_id].copy()
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
         return {'status': 'not_found'}
+    except Exception as e:
+        _safe_log(f"Bootstrap status failed for {session_id}: {str(e)}", "WhatsApp QR Bootstrap")
+        return {'status': 'error', 'message': str(e)}
 
 def _get_session_directory_path(session_id):
     """Get session directory path without creating it"""
@@ -1028,7 +1088,7 @@ def _ensure_driver_for_session(session_id):
             time.sleep(2)
             # Check if connected by locating chat list/sidebar
             wait = WebDriverWait(driver, 10)
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar']")))
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side']")))
 
             # Mark connected in session map
             active_drivers[session_id] = driver
