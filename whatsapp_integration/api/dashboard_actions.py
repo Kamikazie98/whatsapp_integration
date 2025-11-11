@@ -1,25 +1,36 @@
 import frappe
-import requests
 
 @frappe.whitelist()
 def add_device(session_name="default"):
-    """Trigger QR session creation in Unofficial mode"""
+    """Generate QR via Python Selenium service and upsert device."""
     settings = frappe.get_doc("WhatsApp Settings")
     if settings.mode != "Unofficial":
         return {"error": "Add Device works only in Unofficial mode"}
-    
-    api_url = f"{settings.nodejs_url}/qr/{session_name}"
-    res = requests.get(api_url).json()
-    
-    # Save QR in device doc
-    device = frappe.get_doc({
-        "doctype": "WhatsApp Device",
-        "number": session_name,
-        "qr_code": res.get("qr"),
-        "status": "Disconnected"
-    })
-    device.insert(ignore_permissions=True)
-    return {"message": "Device added, scan QR in WhatsApp", "qr": res.get("qr")}
+
+    from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
+
+    res = generate_whatsapp_qr(session_name, timeout=30)
+
+    qr = res.get("qr") if isinstance(res, dict) else None
+    status = res.get("status") if isinstance(res, dict) else None
+
+    # Upsert device doc
+    existing = frappe.db.exists("WhatsApp Device", session_name)
+    if existing:
+        device = frappe.get_doc("WhatsApp Device", session_name)
+        device.qr_code = qr or device.qr_code
+        device.status = "QR Generated" if qr else device.status
+        device.save(ignore_permissions=True)
+    else:
+        device = frappe.get_doc({
+            "doctype": "WhatsApp Device",
+            "number": session_name,
+            "qr_code": qr,
+            "status": "QR Generated" if qr else "Disconnected",
+        })
+        device.insert(ignore_permissions=True)
+
+    return {"message": "Device ready. Scan the QR with WhatsApp.", "qr": qr, "status": status}
 
 @frappe.whitelist()
 def send_test_message(number):

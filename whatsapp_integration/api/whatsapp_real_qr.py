@@ -17,6 +17,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 import os
+import urllib.parse
 
 # Global storage for active QR sessions
 active_qr_sessions = {}
@@ -937,4 +938,49 @@ def health_check_real():
             'chrome_available': False,
             'error': str(e),
             'timestamp': frappe.utils.now()
+        }
+
+@frappe.whitelist()
+def send_message_persistent(session_id, phone_number, message):
+    """Send a WhatsApp message using the persistent Selenium driver.
+
+    Requires that session_id exists in active_drivers (i.e., device linked and kept alive).
+    """
+    try:
+        if session_id not in active_drivers:
+            return {
+                'success': False,
+                'error': 'Session not connected'
+            }
+
+        driver = active_drivers[session_id]
+
+        # Normalize phone to digits only
+        dest = ''.join(filter(str.isdigit, phone_number or ''))
+        if not dest:
+            return {
+                'success': False,
+                'error': 'Invalid destination number'
+            }
+
+        text = urllib.parse.quote(message or '')
+        chat_url = f"https://web.whatsapp.com/send?phone={dest}&text={text}"
+        driver.get(chat_url)
+
+        wait = WebDriverWait(driver, 15)
+        send_button = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='send']"))
+        )
+        send_button.click()
+
+        return {
+            'success': True,
+            'message_id': f"{session_id}_{dest}_{int(time.time())}",
+            'timestamp': frappe.utils.now()
+        }
+    except Exception as e:
+        frappe.log_error(f"Persistent send error for {session_id}: {str(e)}", "WhatsApp Persistent Send")
+        return {
+            'success': False,
+            'error': str(e)
         }
