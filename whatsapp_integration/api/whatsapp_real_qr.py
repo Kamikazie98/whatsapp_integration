@@ -139,7 +139,8 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None, headless=T
         # Set up Chrome options
         chrome_options = Options()
         if headless:
-            chrome_options.add_argument("--headless=new")  # Use new headless mode
+            # Prefer new headless; we may fallback later if startup fails
+            chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
@@ -178,7 +179,27 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None, headless=T
         
         # Create driver with timeout
         try:
-            service = ChromeService(ChromeDriverManager().install())
+            # Allow custom Chrome binary via env
+            import os as _os
+            chrome_binary = _os.environ.get("CHROME_BINARY")
+            if chrome_binary:
+                chrome_options.binary_location = chrome_binary
+                _safe_log(f"Using custom Chrome binary at {chrome_binary}", "WhatsApp Chrome Binary")
+
+            # Prefer explicit chromedriver path if provided
+            chromedriver_path = _os.environ.get("CHROMEDRIVER_PATH")
+            chromedriver_version = _os.environ.get("CHROMEDRIVER_VERSION")
+
+            if chromedriver_path:
+                service = ChromeService(executable_path=chromedriver_path)
+                _safe_log(f"Using CHROMEDRIVER_PATH {chromedriver_path}", "WhatsApp ChromeDriver")
+            else:
+                if chromedriver_version:
+                    service = ChromeService(ChromeDriverManager(version=chromedriver_version).install())
+                    _safe_log(f"Using ChromeDriverManager version={chromedriver_version}", "WhatsApp ChromeDriver")
+                else:
+                    service = ChromeService(ChromeDriverManager().install())
+
             driver = webdriver.Chrome(service=service, options=chrome_options)
             driver.set_page_load_timeout(15)
             _safe_log(f"Chrome driver created successfully", "WhatsApp Chrome Success")
@@ -203,8 +224,56 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None, headless=T
             except Exception as harden_err:
                 _safe_log(f"Hardening script injection failed: {str(harden_err)}", "WhatsApp Chrome Hardening")
         except Exception as driver_error:
-            _safe_log(f"Chrome driver creation failed: {str(driver_error)}", "WhatsApp Chrome Error")
-            raise Exception(f"Failed to start Chrome: {str(driver_error)}")
+            _safe_log(f"Chrome driver creation failed (first attempt): {str(driver_error)}", "WhatsApp Chrome Error")
+            # If headless new fails, try legacy headless once
+            if headless:
+                try:
+                    _safe_log("Retrying with legacy --headless flag", "WhatsApp Chrome Retry")
+                    chrome_options = Options()
+                    chrome_options.add_argument("--headless")
+                    chrome_options.add_argument("--no-sandbox")
+                    chrome_options.add_argument("--disable-dev-shm-usage")
+                    chrome_options.add_argument("--disable-gpu")
+                    chrome_options.add_argument("--window-size=1280,720")
+                    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+                    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                    chrome_options.add_experimental_option('useAutomationExtension', False)
+                    chrome_options.add_argument("--no-proxy-server")
+                    chrome_options.add_argument("--proxy-bypass-list=*")
+                    chrome_options.add_argument("--ignore-certificate-errors")
+                    chrome_options.add_argument("--allow-running-insecure-content")
+                    chrome_options.add_argument("--enable-features=NetworkServiceInProcess")
+                    chrome_options.add_argument("--disable-features=SameSiteByDefaultCookies,CookieDeprecationLabels,PrivacySandboxSettings2")
+                    chrome_prefs = {
+                        "profile.default_content_setting_values.notifications": 1,
+                        "profile.default_content_setting_values.images": 1,
+                        "profile.block_third_party_cookies": False,
+                    }
+                    chrome_options.add_experimental_option("prefs", chrome_prefs)
+                    chrome_options.add_argument("--lang=en-US,en")
+                    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+                    if session_dir:
+                        chrome_options.add_argument(f"--user-data-dir={session_dir}")
+
+                    if chrome_binary:
+                        chrome_options.binary_location = chrome_binary
+
+                    if chromedriver_path:
+                        service = ChromeService(executable_path=chromedriver_path)
+                    else:
+                        if chromedriver_version:
+                            service = ChromeService(ChromeDriverManager(version=chromedriver_version).install())
+                        else:
+                            service = ChromeService(ChromeDriverManager().install())
+
+                    driver = webdriver.Chrome(service=service, options=chrome_options)
+                    driver.set_page_load_timeout(15)
+                except Exception as retry_err:
+                    _safe_log(f"Legacy headless retry failed: {str(retry_err)}", "WhatsApp Chrome Error")
+                    raise Exception(f"Failed to start Chrome: {str(driver_error)}")
+            else:
+                raise Exception(f"Failed to start Chrome: {str(driver_error)}")
         
         # Navigate to WhatsApp Web
         try:
