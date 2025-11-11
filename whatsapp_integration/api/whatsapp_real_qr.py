@@ -146,6 +146,9 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
+        # Improve compatibility with WhatsApp Web
+        chrome_options.add_argument("--lang=en-US,en")
+        chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         
         # Set up session directory with error handling (use precomputed dir)
         try:
@@ -219,32 +222,34 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
         if not qr_element:
             raise Exception("QR code element not found with any selector")
         
-        # Take screenshot of QR area with some padding
-        location = qr_element.location
-        size = qr_element.size
-        
-        # Add padding around QR code
-        padding = 20
-        left = max(0, location['x'] - padding)
-        top = max(0, location['y'] - padding)
-        width = size['width'] + (padding * 2)
-        height = size['height'] + (padding * 2)
-        
-        # Take full screenshot
-        screenshot = driver.get_screenshot_as_png()
-        image = Image.open(io.BytesIO(screenshot))
-        
-        # Crop QR area
-        qr_image = image.crop((left, top, left + width, top + height))
-        
-        # Enhance QR image
-        qr_image = qr_image.convert('RGB')
-        
-        # Convert to base64
-        buffer = io.BytesIO()
-        qr_image.save(buffer, format='PNG', quality=95)
-        img_str = base64.b64encode(buffer.getvalue()).decode()
-        qr_data_url = f"data:image/png;base64,{img_str}"
+        # Prefer exact QR pixels from canvas to avoid scan issues
+        qr_data_url = None
+        try:
+            qr_data_url = driver.execute_script("""
+                const c = document.querySelector('[data-ref] canvas') || document.querySelector('canvas[aria-label*="QR"]') || document.querySelector('div[data-ref] canvas') || document.querySelector('canvas');
+                if (!c) return null;
+                try { return c.toDataURL('image/png'); } catch (e) { return null; }
+            """)
+        except Exception as js_err:
+            _safe_log(f"Canvas toDataURL failed: {str(js_err)}", "WhatsApp QR Canvas")
+
+        if not qr_data_url or not isinstance(qr_data_url, str) or not qr_data_url.startswith("data:image"):
+            # Fallback: screenshot and crop
+            location = qr_element.location
+            size = qr_element.size
+            padding = 20
+            left = max(0, location['x'] - padding)
+            top = max(0, location['y'] - padding)
+            width = size['width'] + (padding * 2)
+            height = size['height'] + (padding * 2)
+
+            screenshot = driver.get_screenshot_as_png()
+            image = Image.open(io.BytesIO(screenshot))
+            qr_image = image.crop((left, top, left + width, top + height)).convert('RGB')
+            buffer = io.BytesIO()
+            qr_image.save(buffer, format='PNG', quality=95)
+            img_str = base64.b64encode(buffer.getvalue()).decode()
+            qr_data_url = f"data:image/png;base64,{img_str}"
         
         # Update session status
         active_qr_sessions[session_id] = {
