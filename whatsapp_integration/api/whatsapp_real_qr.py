@@ -167,6 +167,26 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
             driver = webdriver.Chrome(service=service, options=chrome_options)
             driver.set_page_load_timeout(15)
             _safe_log(f"Chrome driver created successfully", "WhatsApp Chrome Success")
+
+            # Reduce automation detectability
+            try:
+                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                    "source": """
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        window.chrome = { runtime: {} };
+                        const originalQuery = window.navigator.permissions.query;
+                        window.navigator.permissions.query = (parameters) => (
+                          parameters.name === 'notifications' ?
+                            Promise.resolve({ state: Notification.permission }) :
+                            originalQuery(parameters)
+                        );
+                        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                        Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
+                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    """
+                })
+            except Exception as harden_err:
+                _safe_log(f"Hardening script injection failed: {str(harden_err)}", "WhatsApp Chrome Hardening")
         except Exception as driver_error:
             _safe_log(f"Chrome driver creation failed: {str(driver_error)}", "WhatsApp Chrome Error")
             raise Exception(f"Failed to start Chrome: {str(driver_error)}")
@@ -296,19 +316,88 @@ def monitor_qr_scan(driver, session_id, timeout=300):
             except:
                 pass
             
-            # Check if QR expired or changed
+            # Check if QR expired or changed; if so, recapture and update session QR
             try:
                 qr_element = driver.find_element(By.CSS_SELECTOR, '[data-ref] canvas')
                 if not qr_element:
-                    # QR might have expired, generate new one
-                    break
-            except:
-                break
+                    _safe_log("QR element missing, attempting recapture", "WhatsApp QR Monitor")
+                    _recapture_qr(driver, session_id)
+                    continue
+                # If element exists but may have been refreshed, try to fetch fresh pixels periodically
+                if int(time.time() - active_qr_sessions.get(session_id, {}).get('generated_at', 0)) >= 20:
+                    _safe_log("Refreshing QR (periodic refresh)", "WhatsApp QR Monitor")
+                    _recapture_qr(driver, session_id)
+            except Exception as qr_check_err:
+                _safe_log(f"QR check error, attempting recapture: {str(qr_check_err)}", "WhatsApp QR Monitor")
+                _recapture_qr(driver, session_id)
             
             time.sleep(2)
             
     except Exception as e:
         _safe_log(f"QR Monitor Error: {str(e)}", "WhatsApp QR Monitor")
+
+def _recapture_qr(driver, session_id):
+    """Recapture QR from current page and update session store"""
+    try:
+        # Wait for QR to be present again
+        wait = WebDriverWait(driver, 15)
+        qr_element = None
+        qr_selectors = [
+            '[data-ref] canvas',
+            'canvas[aria-label*="QR"]',
+            'div[data-ref] canvas',
+            'canvas'
+        ]
+        for selector in qr_selectors:
+            try:
+                qr_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+                if qr_element and qr_element.size['width'] > 200 and qr_element.size['height'] > 200:
+                    break
+            except:
+                continue
+
+        if not qr_element:
+            raise Exception("Unable to locate QR element on recapture")
+
+        # Prefer canvas pixels; fallback to cropped screenshot
+        qr_data_url = None
+        try:
+            qr_data_url = driver.execute_script("""
+                const c = document.querySelector('[data-ref] canvas') || document.querySelector('canvas[aria-label*="QR"]') || document.querySelector('div[data-ref] canvas') || document.querySelector('canvas');
+                if (!c) return null;
+                try { return c.toDataURL('image/png'); } catch (e) { return null; }
+            """)
+        except Exception as js_err:
+            _safe_log(f"Canvas toDataURL (recapture) failed: {str(js_err)}", "WhatsApp QR Recapture")
+
+        if not qr_data_url or not isinstance(qr_data_url, str) or not qr_data_url.startswith("data:image"):
+            location = qr_element.location
+            size = qr_element.size
+            padding = 20
+            left = max(0, location['x'] - padding)
+            top = max(0, location['y'] - padding)
+            width = size['width'] + (padding * 2)
+            height = size['height'] + (padding * 2)
+            import io as _io
+            import base64 as _b64
+            from PIL import Image as _Image
+            screenshot = driver.get_screenshot_as_png()
+            image = _Image.open(_io.BytesIO(screenshot))
+            qr_image = image.crop((left, top, left + width, top + height)).convert('RGB')
+            buffer = _io.BytesIO()
+            qr_image.save(buffer, format='PNG', quality=95)
+            img_str = _b64.b64encode(buffer.getvalue()).decode()
+            qr_data_url = f"data:image/png;base64,{img_str}"
+
+        active_qr_sessions[session_id] = {
+            'status': 'qr_ready',
+            'qr_data': qr_data_url,
+            'generated_at': time.time(),
+            'driver_active': True
+        }
+        _safe_log("QR recaptured and session updated", "WhatsApp QR Recapture")
+    except Exception as rec_err:
+        _safe_log(f"QR recapture failed: {str(rec_err)}", "WhatsApp QR Recapture")
 
 def get_session_directory(session_id):
     """Get session directory for Chrome profile"""

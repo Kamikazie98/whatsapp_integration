@@ -193,7 +193,7 @@ def refresh_qr_code(device_name):
         
         if result.get("status") == "qr_generated":
             device.qr_code = result.get("qr")
-            device.status = "Disconnected"
+            device.status = "QR Generated"
             device.save()
             return {"message": "QR Code refreshed successfully"}
         elif result.get("status") == "already_connected":
