@@ -19,7 +19,7 @@ import os
 active_qr_sessions = {}
 
 @frappe.whitelist()
-def generate_whatsapp_qr(session_id, timeout=30):
+def generate_whatsapp_qr(session_id, timeout=30, headless=True):
     """Generate QR code for WhatsApp Web authentication with better error handling"""
     try:
         frappe.log_error(f"Starting QR generation for session: {session_id}", "WhatsApp QR Debug")
@@ -51,7 +51,7 @@ def generate_whatsapp_qr(session_id, timeout=30):
             session_dir = tempfile.mkdtemp(prefix=f"whatsapp_{session_id}_")
 
         # Start a new QR session in background with prepared context
-        start_qr_session(session_id, site_name, session_dir)
+        start_qr_session(session_id, site_name, session_dir, headless=headless)
         
         # Wait up to timeout seconds for QR to be ready
         wait_time = timeout
@@ -95,7 +95,7 @@ def generate_whatsapp_qr(session_id, timeout=30):
             del active_qr_sessions[session_id]
         raise Exception(error_msg)
 
-def start_qr_session(session_id, site_name=None, session_dir=None):
+def start_qr_session(session_id, site_name=None, session_dir=None, headless=True):
     """Start QR generation session in background thread"""
     if session_id in active_qr_sessions:
         return  # Already started
@@ -107,7 +107,7 @@ def start_qr_session(session_id, site_name=None, session_dir=None):
     }
     
     # Start in background thread
-    thread = threading.Thread(target=capture_whatsapp_qr, args=(session_id, site_name, session_dir))
+    thread = threading.Thread(target=capture_whatsapp_qr, args=(session_id, site_name, session_dir, headless))
     thread.daemon = True
     thread.start()
 
@@ -121,7 +121,7 @@ def _safe_log(message, title="WhatsApp QR Thread"):
         except Exception:
             pass
 
-def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
+def capture_whatsapp_qr(session_id, site_name=None, session_dir=None, headless=True):
     """Capture real WhatsApp Web QR code"""
     driver = None
     try:
@@ -138,7 +138,8 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
         
         # Set up Chrome options
         chrome_options = Options()
-        chrome_options.add_argument("--headless=new")  # Use new headless mode
+        if headless:
+            chrome_options.add_argument("--headless=new")  # Use new headless mode
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
@@ -146,6 +147,20 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
+        # Networking hardening
+        chrome_options.add_argument("--no-proxy-server")
+        chrome_options.add_argument("--proxy-bypass-list=*")
+        chrome_options.add_argument("--ignore-certificate-errors")
+        chrome_options.add_argument("--allow-running-insecure-content")
+        chrome_options.add_argument("--enable-features=NetworkServiceInProcess")
+        chrome_options.add_argument("--disable-features=SameSiteByDefaultCookies,CookieDeprecationLabels,PrivacySandboxSettings2")
+        # Permissions and prefs
+        chrome_prefs = {
+            "profile.default_content_setting_values.notifications": 1,
+            "profile.default_content_setting_values.images": 1,
+            "profile.block_third_party_cookies": False,
+        }
+        chrome_options.add_experimental_option("prefs", chrome_prefs)
         # Improve compatibility with WhatsApp Web
         chrome_options.add_argument("--lang=en-US,en")
         chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -312,6 +327,10 @@ def monitor_qr_scan(driver, session_id, timeout=300):
                         'connected_at': time.time(),
                         'message': 'Successfully connected to WhatsApp'
                     }
+                    try:
+                        _mark_device_connected(session_id)
+                    except Exception as upd_err:
+                        _safe_log(f"Failed to update device doc: {str(upd_err)}", "WhatsApp Device Update")
                     return
             except:
                 pass
@@ -336,6 +355,42 @@ def monitor_qr_scan(driver, session_id, timeout=300):
     except Exception as e:
         _safe_log(f"QR Monitor Error: {str(e)}", "WhatsApp QR Monitor")
 
+def _mark_device_connected(session_id):
+    """Update WhatsApp Device doc matching session_id (number) to Connected"""
+    try:
+        # Find device by number field
+        devices = frappe.get_all("WhatsApp Device", filters={"number": session_id}, fields=["name", "status"])
+        if not devices:
+            _safe_log(f"No WhatsApp Device found for number {session_id}", "WhatsApp Device Update")
+            return
+        name = devices[0]["name"]
+        doc = frappe.get_doc("WhatsApp Device", name)
+        doc.status = "Connected"
+        # Clear QR code after connection if field exists
+        try:
+            if hasattr(doc, "qr_code"):
+                doc.qr_code = None
+        except Exception:
+            pass
+        doc.save()
+        _safe_log(f"Device {name} marked Connected", "WhatsApp Device Update")
+    except Exception as e:
+        _safe_log(f"Device update failed: {str(e)}", "WhatsApp Device Update")
+
+@frappe.whitelist()
+def sync_device_status(session_id):
+    """Manually sync device status from active QR session to WhatsApp Device"""
+    try:
+        session = active_qr_sessions.get(session_id)
+        if not session:
+            return {"status": "not_found"}
+        if session.get("status") == "connected":
+            _mark_device_connected(session_id)
+            return {"status": "connected", "synced": True}
+        return {"status": session.get("status"), "synced": False}
+    except Exception as e:
+        frappe.log_error(f"Sync device status failed: {str(e)}", "WhatsApp Device Sync")
+        return {"status": "error", "message": str(e)}
 def _recapture_qr(driver, session_id):
     """Recapture QR from current page and update session store"""
     try:
