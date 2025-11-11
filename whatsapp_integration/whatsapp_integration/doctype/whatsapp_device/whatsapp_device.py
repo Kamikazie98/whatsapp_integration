@@ -96,8 +96,8 @@ class WhatsAppDevice(Document):
             # Prefer the full real QR service first (keeps session alive and monitors scan)
             try:
                 from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
-                frappe.msgprint("Generating WhatsApp QR (persistent session)...")
-                result = generate_whatsapp_qr(self.number, timeout=20)
+                frappe.msgprint("Generating WhatsApp QR (persistent session, first run may take up to 1-2 minutes)...")
+                result = generate_whatsapp_qr(self.number, timeout=90)
 
                 if result.get("status") == "qr_generated":
                     self.qr_code = result.get("qr")
@@ -109,6 +109,16 @@ class WhatsAppDevice(Document):
                     self.status = "Connected"
                     self.save()  # Save the status update
                     frappe.msgprint(f"Device {self.number} is already connected!")
+                    return result
+                elif result.get("status") in ("starting", "qr_ready"):
+                    # Session is starting or QR monitor has begun but payload didn't include QR yet
+                    # Mark as QR Generated so client JS starts polling live QR updates
+                    self.status = "QR Generated"
+                    # Save QR if present
+                    if result.get("qr"):
+                        self.qr_code = result.get("qr")
+                    self.save()
+                    frappe.msgprint("QR session started. Keep the dialog open; QR will update live.")
                     return result
                 else:
                     raise Exception("Persistent QR generation failed")
@@ -165,6 +175,63 @@ class WhatsAppDevice(Document):
         except Exception as e:
             frappe.log_error(f"Connection Test Error: {str(e)}", "WhatsApp Connection Test")
             return {"success": False, "message": f"Connection test failed: {str(e)}"}
+
+    @frappe.whitelist()
+    def sync_status(self):
+        """Sync DocType status with real QR/driver status.
+
+        Mapping:
+        - connected  -> Status = Connected
+        - qr_ready   -> Status = QR Generated and update qr_code
+        - starting   -> Status = QR Generated (UI continues polling)
+        - not_found/error -> Status = Disconnected (if not already Connected)
+        """
+        try:
+            status_payload = None
+            try:
+                from whatsapp_integration.api.whatsapp_real_qr import check_qr_status
+                status_payload = check_qr_status(self.number)
+            except Exception:
+                status_payload = None
+
+            updated = False
+            msg = None
+
+            if isinstance(status_payload, dict):
+                st = status_payload.get("status")
+                if st == "connected":
+                    if self.status != "Connected":
+                        self.status = "Connected"
+                        updated = True
+                    msg = "Device is connected."
+                elif st in ("qr_ready", "starting"):
+                    if self.status != "QR Generated":
+                        self.status = "QR Generated"
+                        updated = True
+                    qr = status_payload.get("qr") or status_payload.get("qr_data")
+                    if qr and self.qr_code != qr:
+                        self.qr_code = qr
+                        updated = True
+                    msg = "QR session active. Keep the dialog open."
+                elif st in ("error", "not_found"):
+                    if self.status != "Connected":
+                        self.status = "Disconnected"
+                        updated = True
+                    msg = f"Status: {st}"
+
+            if updated:
+                self.save()
+
+            return {
+                "success": True,
+                "updated": updated,
+                "status": self.status,
+                "message": msg or "Status synced"
+            }
+
+        except Exception as e:
+            frappe.log_error(f"Sync Status Error: {str(e)}", "WhatsApp Device Sync")
+            return {"success": False, "message": f"Failed to sync status: {str(e)}"}
 
     @frappe.whitelist()
     def mark_connected(self):

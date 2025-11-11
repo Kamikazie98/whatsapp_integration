@@ -108,6 +108,18 @@ def generate_whatsapp_qr(session_id, timeout=30):
         
         # If we get here, it timed out
         frappe.log_error(f"QR generation timed out for session: {session_id}", "WhatsApp QR Timeout")
+        # If a background session exists, return its current status so client can poll
+        if session_id in active_qr_sessions:
+            session_data = active_qr_sessions.get(session_id, {})
+            status = session_data.get('status', 'starting')
+            payload = {
+                'status': status,
+                'session': session_id,
+                'message': f'QR generation still in progress after {timeout} seconds'
+            }
+            if status == 'qr_ready' and session_data.get('qr_data'):
+                payload['qr'] = session_data.get('qr_data')
+            return payload
         raise Exception(f"QR generation timed out after {timeout} seconds")
         
     except Exception as e:

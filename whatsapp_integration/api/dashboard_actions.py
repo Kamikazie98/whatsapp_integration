@@ -9,7 +9,8 @@ def add_device(session_name="default"):
 
     from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
 
-    res = generate_whatsapp_qr(session_name, timeout=30)
+    # Allow enough time for first-time ChromeDriver download/startup
+    res = generate_whatsapp_qr(session_name, timeout=90)
 
     qr = res.get("qr") if isinstance(res, dict) else None
     status = res.get("status") if isinstance(res, dict) else None

@@ -21,12 +21,10 @@ frappe.ui.form.on('WhatsApp Device', {
                                 frm.refresh_field('qr_code');
                                 
                 // Show QR code in dialog immediately after generation (live updates)
-                if (frm.doc.qr_code) {
-                    // Add a small delay to ensure field is updated
-                    setTimeout(() => {
-                        show_qr_dialog(frm.doc.qr_code, frm.doc.number, frm);
-                    }, 500);
-                }
+                // Always open dialog; image will live-update if QR not ready yet
+                setTimeout(() => {
+                    show_qr_dialog(frm.doc.qr_code || '', frm.doc.number, frm);
+                }, 500);
                                 frappe.show_alert({
                                     message: __('QR Code generated successfully! Scan the QR code now!'),
                                     indicator: 'green'
@@ -101,6 +99,17 @@ frappe.ui.form.on('WhatsApp Device', {
                     }
                 });
             }, __('Actions'));
+
+            // Add Sync Status button (updates DocType from real session)
+            frm.add_custom_button(__('Sync Status'), function() {
+                frm.call('sync_status').then((res) => {
+                    const msg = (res && res.message && res.message.message) || __('Status synced');
+                    frappe.show_alert({ message: msg, indicator: 'green' }, 5);
+                    frm.reload_doc();
+                }).catch(() => {
+                    frappe.show_alert({ message: __('Failed to sync status'), indicator: 'red' }, 5);
+                });
+            }, __('Actions'));
         }
         
         // Add Troubleshoot button for linking issues
@@ -141,12 +150,7 @@ frappe.ui.form.on('WhatsApp Device', {
             display_qr_inline(frm);
         }
         
-        // Auto-show QR dialog if status is "QR Generated"
-        if (frm.doc.status === 'QR Generated' && frm.doc.qr_code && !frm.doc.__islocal) {
-            setTimeout(() => {
-                show_qr_dialog(frm.doc.qr_code, frm.doc.number, frm);
-            }, 1000); // Auto-show QR after 1 second
-        }
+        // Auto-show disabled to avoid duplicate dialogs; dialog opens after generation callback
         
         // Auto-refresh for QR Generated devices
         if (frm.doc.status === 'QR Generated' && !frm.doc.__islocal) {
@@ -166,6 +170,10 @@ function show_qr_dialog(qr_data, device_number, frm) {
     // If it's a file path, make sure it's accessible
     else if (qr_data && !qr_data.startsWith('http') && !qr_data.startsWith('/files/')) {
         qr_src = '/files/' + qr_data;
+    }
+    // If empty, use a 1x1 transparent placeholder
+    if (!qr_src) {
+        qr_src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
     }
     
     let dialog = new frappe.ui.Dialog({
@@ -298,6 +306,10 @@ function display_qr_inline(frm) {
     // If it's a file path, make sure it's accessible
     else if (qr_src && !qr_src.startsWith('http') && !qr_src.startsWith('/files/')) {
         qr_src = '/files/' + qr_src;
+    }
+    // If empty, use a 1x1 transparent placeholder
+    if (!qr_src) {
+        qr_src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
     }
     
     // Remove existing QR container
