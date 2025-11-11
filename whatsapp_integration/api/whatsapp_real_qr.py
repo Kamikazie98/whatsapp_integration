@@ -592,8 +592,9 @@ def monitor_qr_scan(driver, session_id, session_dir=None, timeout=600):
                     # Check if connected (multiple indicators)
                     chat_list = driver.find_elements(By.CSS_SELECTOR, '[data-testid="chat-list"]')
                     side_panel = driver.find_elements(By.CSS_SELECTOR, '[data-testid="sidebar"]')
+                    pane_side = driver.find_elements(By.CSS_SELECTOR, '[data-testid="pane-side"]')
                     
-                    if chat_list or side_panel:
+                    if chat_list or side_panel or pane_side:
                         # Connected! Update session and keep driver alive
                         _safe_log(f"Connection detected for session: {session_id}", "WhatsApp Connection")
                         active_qr_sessions[session_id] = {
@@ -766,6 +767,13 @@ def _bootstrap_session_status(session_id):
                     'driver_active': True,
                     'session_dir': session_dir,
                 }
+                # Start monitor so that when user scans, status flips to connected
+                try:
+                    t = threading.Thread(target=monitor_qr_scan, args=(driver, session_id, session_dir))
+                    t.daemon = True
+                    t.start()
+                except Exception:
+                    pass
                 return active_qr_sessions[session_id].copy()
         except Exception:
             pass
