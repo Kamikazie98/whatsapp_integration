@@ -20,13 +20,13 @@ frappe.ui.form.on('WhatsApp Device', {
                                 // Force refresh of the QR field
                                 frm.refresh_field('qr_code');
                                 
-                                // Show QR code in dialog immediately after generation
-                                if (frm.doc.qr_code) {
-                                    // Add a small delay to ensure field is updated
-                                    setTimeout(() => {
-                                        show_qr_dialog(frm.doc.qr_code, frm.doc.number, frm);
-                                    }, 500);
-                                }
+                // Show QR code in dialog immediately after generation (live updates)
+                if (frm.doc.qr_code) {
+                    // Add a small delay to ensure field is updated
+                    setTimeout(() => {
+                        show_qr_dialog(frm.doc.qr_code, frm.doc.number, frm);
+                    }, 500);
+                }
                                 frappe.show_alert({
                                     message: __('QR Code generated successfully! Scan the QR code now!'),
                                     indicator: 'green'
@@ -177,7 +177,7 @@ function show_qr_dialog(qr_data, device_number, frm) {
                 options: `
                     <div class="text-center">
                         <div id="qr-container">
-                            <img src="${qr_src}" 
+                            <img id="qr-dialog-img" src="${qr_src}" 
                                  style="max-width: 400px; border: 2px solid #28a745; padding: 15px; border-radius: 10px;"
                                  onerror="this.style.display='none'; document.getElementById('qr-error').style.display='block';">
                             <div id="qr-error" style="display: none; color: red; padding: 20px;">
@@ -254,6 +254,37 @@ function show_qr_dialog(qr_data, device_number, frm) {
         }
     });
     dialog.show();
+
+    // Live update QR image every 3 seconds while dialog open
+    const poll = () => {
+        frappe.call({
+            method: 'whatsapp_integration.api.whatsapp_real_qr.check_qr_status',
+            args: { session_id: device_number },
+            callback: function(r) {
+                const data = r.message || {};
+                if (data.status === 'connected') {
+                    // Connected: stop polling and refresh form
+                    if (dialog.__qr_timer) clearInterval(dialog.__qr_timer);
+                    dialog.hide();
+                    if (frm) frm.reload_doc();
+                    return;
+                }
+                if (data.qr_data) {
+                    const img = dialog.$wrapper.find('#qr-dialog-img');
+                    if (img && img.length) {
+                        const current = img.attr('src');
+                        if (current !== data.qr_data) {
+                            img.attr('src', data.qr_data);
+                        }
+                    }
+                }
+            }
+        });
+    };
+    dialog.__qr_timer = setInterval(poll, 3000);
+    dialog.$wrapper.on('hidden.bs.modal', () => {
+        if (dialog.__qr_timer) clearInterval(dialog.__qr_timer);
+    });
 }
 
 function display_qr_inline(frm) {
@@ -277,7 +308,7 @@ function display_qr_inline(frm) {
         <div class="custom-qr-container" style="text-align: center; margin: 20px; padding: 20px; border: 1px solid #ddd; border-radius: 8px; background: #f9f9f9;">
             <h4 style="color: #28a745; margin-bottom: 15px;">📱 WhatsApp QR Code</h4>
             <div style="margin-bottom: 15px;">
-                <img src="${qr_src}" 
+                <img id="qr-inline-img" src="${qr_src}" 
                      style="max-width: 300px; border: 2px solid #28a745; padding: 15px; border-radius: 10px; background: white;"
                      onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
                 <div style="display: none; color: red; padding: 20px;">
@@ -316,7 +347,7 @@ function display_qr_inline(frm) {
 }
 
 function setup_auto_refresh(frm) {
-    // Auto-refresh every 15 seconds for QR Generated devices
+    // Auto-refresh every 3 seconds for QR updates and connection status
     if (frm.auto_refresh_timer) {
         clearInterval(frm.auto_refresh_timer);
     }
@@ -329,16 +360,27 @@ function setup_auto_refresh(frm) {
                     session_id: frm.doc.number
                 },
                 callback: function(r) {
-                    if (r.message && r.message.status === 'connected') {
+                    const data = r.message || {};
+                    if (data.status === 'connected') {
                         clearInterval(frm.auto_refresh_timer);
                         frm.reload_doc();
+                        return;
+                    }
+                    if (data.qr_data) {
+                        const img = $(frm.wrapper).find('#qr-inline-img');
+                        if (img && img.length) {
+                            const current = img.attr('src');
+                            if (current !== data.qr_data) {
+                                img.attr('src', data.qr_data);
+                            }
+                        }
                     }
                 }
             });
         } else {
             clearInterval(frm.auto_refresh_timer);
         }
-    }, 15000); // Check every 15 seconds
+    }, 3000); // Check every 3 seconds
 }
 
 // Clean up timer when form is destroyed
