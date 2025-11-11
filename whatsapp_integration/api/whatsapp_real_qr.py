@@ -19,11 +19,102 @@ from webdriver_manager.chrome import ChromeDriverManager
 import re
 import os
 import urllib.parse
+from datetime import datetime
 
 # Global storage for active QR sessions
 active_qr_sessions = {}
 # Global storage for active drivers (to keep sessions alive)
 active_drivers = {}
+# Global log lock for safe file writes
+_log_lock = threading.Lock()
+
+# Centralized log naming/location
+LOG_SUBDIR = 'whatsapp_logs'
+LOG_FILENAME = 'whatsapp_real_qr.log'
+
+def _resolve_log_base_dir():
+    """Resolve base directory used for file logging and a descriptive source label.
+
+    Order of preference:
+    1) Site private files: <site>/private/files
+    2) System temp directory
+    3) Current working directory
+    """
+    try:
+        base_dir = frappe.get_site_path('private', 'files', LOG_SUBDIR)
+        return base_dir, 'site_private'
+    except Exception:
+        try:
+            import tempfile
+            base_dir = os.path.join(tempfile.gettempdir(), LOG_SUBDIR)
+            return base_dir, 'system_temp'
+        except Exception:
+            # last resort: current working directory
+            base_dir = os.path.join(os.getcwd(), LOG_SUBDIR)
+            return base_dir, 'cwd'
+
+def _get_log_file_path():
+    """Return path to the file-based log, creating directories as needed.
+
+    Prefers site private files: <site>/private/files/whatsapp_logs/whatsapp_real_qr.log
+    Falls back to system temp if frappe context isn't available.
+    """
+    base_dir, _ = _resolve_log_base_dir()
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(base_dir, LOG_FILENAME)
+
+def _append_file_log(title, message):
+    """Append a structured log line to the file log safely."""
+    try:
+        ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        safe_title = str(title or 'Log')
+        text = str(message)
+        # Avoid extremely large payloads in logs
+        if len(text) > 4000:
+            text = text[:4000] + '... [truncated]'
+        line = f"{ts} | {safe_title} | {text}\n"
+        path = _get_log_file_path()
+        with _log_lock:
+            with open(path, 'a', encoding='utf-8', errors='ignore') as f:
+                f.write(line)
+    except Exception:
+        # Never raise from logging
+        pass
+
+@frappe.whitelist()
+def get_real_qr_log_path():
+    """Return the current log file path and metadata so it's clear where logs are saved.
+
+    Returns a dict like:
+    {
+        'path': '<absolute path to log file>',
+        'base_source': 'site_private' | 'system_temp' | 'cwd',
+        'exists': true/false,
+        'size_bytes': <int or 0>
+    }
+    """
+    try:
+        base_dir, source = _resolve_log_base_dir()
+        path = os.path.join(base_dir, LOG_FILENAME)
+        exists = os.path.exists(path)
+        size = os.path.getsize(path) if exists else 0
+        return {
+            'path': path,
+            'base_source': source,
+            'exists': exists,
+            'size_bytes': size,
+        }
+    except Exception as e:
+        return {
+            'path': None,
+            'base_source': None,
+            'exists': False,
+            'size_bytes': 0,
+            'error': str(e)
+        }
 
 @frappe.whitelist()
 def generate_whatsapp_qr(session_id, timeout=30):
@@ -158,6 +249,11 @@ def _safe_log(message, title="WhatsApp QR Thread"):
             print(f"[{title}] {message}")
         except Exception:
             pass
+    # Always try to write to file-based log too (best-effort)
+    try:
+        _append_file_log(title, message)
+    except Exception:
+        pass
 
 def _build_chrome_options(user_data_dir=None):
     """Build Chrome options with all necessary arguments"""
@@ -580,21 +676,27 @@ def monitor_qr_scan(driver, session_id, session_dir=None, timeout=600):
         connection_check_interval = 2  # Check connection every 2 seconds
         last_qr_check = 0
         last_connection_check = 0
-        
+
         _safe_log(f"Starting QR monitor for session: {session_id}", "WhatsApp QR Monitor")
-        
+
         while time.time() - start_time < timeout:
             current_time = time.time()
-            
+
             # Check for connection more frequently
             if current_time - last_connection_check >= connection_check_interval:
                 last_connection_check = current_time
                 try:
+                    # Try to resolve possible takeover prompt ("Use here")
+                    try:
+                        _try_click_use_here(driver)
+                    except Exception:
+                        pass
+
                     # Check if connected (multiple indicators)
                     chat_list = driver.find_elements(By.CSS_SELECTOR, '[data-testid="chat-list"]')
                     side_panel = driver.find_elements(By.CSS_SELECTOR, '[data-testid="sidebar"]')
                     pane_side = driver.find_elements(By.CSS_SELECTOR, '[data-testid="pane-side"]')
-                    
+
                     if chat_list or side_panel or pane_side:
                         # Connected! Update session and keep driver alive
                         _safe_log(f"Connection detected for session: {session_id}", "WhatsApp Connection")
@@ -693,21 +795,63 @@ def check_qr_status(session_id):
     """Check status of QR generation and return latest QR if available"""
     if session_id in active_qr_sessions:
         session_data = active_qr_sessions[session_id].copy()
-        if session_data.get('status') == 'qr_ready' and session_id in active_drivers:
+
+        # If we have a live driver, proactively detect connection and update state
+        if session_id in active_drivers:
             try:
                 driver = active_drivers[session_id]
-                qr_elements = driver.find_elements(By.CSS_SELECTOR, '[data-ref] canvas')
-                if qr_elements and len(qr_elements) > 0:
-                    latest_qr = _extract_qr_from_canvas(driver, qr_elements[0])
-                    if latest_qr:
-                        current_hash = _get_qr_hash(latest_qr)
-                        old_hash = _get_qr_hash(session_data.get('qr_data'))
-                        if current_hash != old_hash:
-                            session_data['qr_data'] = latest_qr
-                            session_data['generated_at'] = time.time()
-                            active_qr_sessions[session_id] = session_data
+
+                # Attempt to take over if a takeover prompt is shown
+                try:
+                    _try_click_use_here(driver)
+                except Exception:
+                    pass
+
+                # Check if already connected (fast path)
+                try:
+                    candidates = driver.find_elements(By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']")
+                except Exception:
+                    candidates = []
+
+                if candidates:
+                    updated = {
+                        'status': 'connected',
+                        'connected_at': session_data.get('connected_at') or time.time(),
+                        'driver_active': True,
+                        'session_dir': session_data.get('session_dir') or None,
+                        'message': 'Successfully connected to WhatsApp'
+                    }
+                    active_qr_sessions[session_id] = updated
+                    # Ensure keep-alive is running (best-effort)
+                    try:
+                        t = threading.Thread(target=_keep_session_alive, args=(driver, session_id, updated.get('session_dir')))
+                        t.daemon = True
+                        t.start()
+                    except Exception:
+                        pass
+                    return active_qr_sessions[session_id].copy()
+
+                # Not connected yet; if QR is present, optionally refresh the QR image
+                try:
+                    qr_elements = driver.find_elements(By.CSS_SELECTOR, '[data-ref] canvas')
+                except Exception:
+                    qr_elements = []
+
+                if qr_elements:
+                    try:
+                        latest_qr = _extract_qr_from_canvas(driver, qr_elements[0])
+                        if latest_qr:
+                            current_hash = _get_qr_hash(latest_qr)
+                            old_hash = _get_qr_hash(session_data.get('qr_data'))
+                            if current_hash != old_hash:
+                                session_data['qr_data'] = latest_qr
+                                session_data['generated_at'] = time.time()
+                                active_qr_sessions[session_id] = session_data
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
         return session_data
     # Try to bootstrap status from persisted profile if not found in memory
     boot = _bootstrap_session_status(session_id)
