@@ -93,52 +93,52 @@ class WhatsAppDevice(Document):
             return
         
         try:
-			# Prefer the full real QR service first (keeps session alive and monitors scan)
+            # Prefer the full real QR service first (keeps session alive and monitors scan)
             try:
-				from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
-				frappe.msgprint("Generating WhatsApp QR (persistent session)...")
-				result = generate_whatsapp_qr(self.number, timeout=20)
+                from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
+                frappe.msgprint("Generating WhatsApp QR (persistent session)...")
+                result = generate_whatsapp_qr(self.number, timeout=20)
 
                 if result.get("status") == "qr_generated":
                     self.qr_code = result.get("qr")
                     self.status = "QR Generated"
                     self.save()  # Save the document to persist QR data
-					frappe.msgprint(f"QR generated for {self.number}. Scan with your phone to connect.")
+                    frappe.msgprint(f"QR generated for {self.number}. Scan with your phone to connect.")
                     return result
-				elif result.get("status") == "already_connected":
-					self.status = "Connected"
-					self.save()  # Save the status update
-					frappe.msgprint(f"Device {self.number} is already connected!")
-					return result
+                elif result.get("status") == "already_connected":
+                    self.status = "Connected"
+                    self.save()  # Save the status update
+                    frappe.msgprint(f"Device {self.number} is already connected!")
+                    return result
                 else:
-					raise Exception("Persistent QR generation failed")
-                    
-			except Exception as real_qr_error:
-				frappe.log_error(f"Persistent QR Generation Failed: {str(real_qr_error)}", "WhatsApp Device")
-				frappe.msgprint(f"Persistent QR failed: {str(real_qr_error)}. Trying quick method...")
-                
-				# Fallback to quick QR (non-persistent; last resort before simple)
+                    raise Exception("Persistent QR generation failed")
+
+            except Exception as real_qr_error:
+                frappe.log_error(f"Persistent QR Generation Failed: {str(real_qr_error)}", "WhatsApp Device")
+                frappe.msgprint(f"Persistent QR failed: {str(real_qr_error)}. Trying quick method...")
+
+                # Fallback to quick QR (non-persistent; last resort before simple)
                 try:
-					from whatsapp_integration.api.whatsapp_quick_qr import generate_quick_qr
-					result = generate_quick_qr(self.number)
-                    
+                    from whatsapp_integration.api.whatsapp_quick_qr import generate_quick_qr
+                    result = generate_quick_qr(self.number)
+
                     if result.get("status") == "qr_generated":
                         self.qr_code = result.get("qr")
                         self.status = "QR Generated"
                         self.save()  # Save the document to persist QR data
-						frappe.msgprint(f"Quick QR generated for {self.number}. Scan with your phone!")
+                        frappe.msgprint(f"Quick QR generated for {self.number}. Scan with your phone!")
                         return result
                     else:
-						raise Exception(result.get('message', 'Quick QR failed'))
-                        
-				except Exception as quick_qr_error:
-					frappe.log_error(f"Quick QR Generation Failed: {str(quick_qr_error)}", "WhatsApp Device")
-					frappe.msgprint(f"Quick QR failed: {str(quick_qr_error)}. Using simple fallback...")
-                    
+                        raise Exception(result.get('message', 'Quick QR failed'))
+
+                except Exception as quick_qr_error:
+                    frappe.log_error(f"Quick QR Generation Failed: {str(quick_qr_error)}", "WhatsApp Device")
+                    frappe.msgprint(f"Quick QR failed: {str(quick_qr_error)}. Using simple fallback...")
+
                     # Final fallback to simple QR generation
                     from whatsapp_integration.api.whatsapp_simple import generate_simple_qr_code
                     result = generate_simple_qr_code(self.number)
-                    
+
                     if result.get("status") == "qr_generated":
                         self.qr_code = result.get("qr")
                         self.status = "QR Generated"
