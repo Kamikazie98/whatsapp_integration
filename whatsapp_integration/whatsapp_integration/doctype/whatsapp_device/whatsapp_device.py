@@ -20,12 +20,45 @@ class WhatsAppDevice(Document):
 
     @frappe.whitelist()
     def check_connection_status(self):
-        """Check actual WhatsApp connection status (not just QR session)"""
+        """Check real WhatsApp connection status and sync DocType."""
         try:
-            # Check if we have a real WhatsApp connection
+            real_status = None
+            try:
+                from whatsapp_integration.api.whatsapp_real_qr import check_qr_status
+                real_status = check_qr_status(self.number)
+            except Exception:
+                real_status = None
+
+            if isinstance(real_status, dict):
+                st = real_status.get("status")
+                if st == "connected":
+                    if self.status != "Connected":
+                        self.status = "Connected"
+                        self.save()
+                    return {
+                        "status": "connected",
+                        "message": f"Device {self.number} is connected to WhatsApp",
+                        "device_number": self.number,
+                        "last_sync": self.last_sync
+                    }
+                if st in ("qr_ready", "starting"):
+                    if self.status != "QR Generated":
+                        self.status = "QR Generated"
+                        qr = real_status.get("qr") or real_status.get("qr_data")
+                        if qr:
+                            self.qr_code = qr
+                        self.save()
+                    return {
+                        "status": "qr_generated",
+                        "message": f"QR code generated for {self.number}. Please scan to connect.",
+                        "device_number": self.number
+                    }
+                if st in ("error", "not_found") and self.status != "Connected":
+                    if self.status != "Disconnected":
+                        self.status = "Disconnected"
+                        self.save()
+
             if self.status == "Connected":
-                # For now, return connected status
-                # In a real implementation, you'd ping WhatsApp Web or check session validity
                 return {
                     "status": "connected",
                     "message": f"Device {self.number} is connected to WhatsApp",
@@ -34,7 +67,7 @@ class WhatsAppDevice(Document):
                 }
             elif self.status == "QR Generated":
                 return {
-                    "status": "qr_generated", 
+                    "status": "qr_generated",
                     "message": f"QR code generated for {self.number}. Please scan to connect.",
                     "device_number": self.number
                 }
@@ -44,7 +77,7 @@ class WhatsAppDevice(Document):
                     "message": f"Device {self.number} is not connected. Generate QR code to connect.",
                     "device_number": self.number
                 }
-                
+
         except Exception as e:
             frappe.log_error(f"Error checking connection status: {str(e)}", "WhatsApp Connection Status")
             return {
