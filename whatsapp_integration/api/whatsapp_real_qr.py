@@ -2,10 +2,12 @@ import frappe
 import requests
 import base64
 import io
+import hashlib
 from PIL import Image
 import time
 import threading
 import platform
+import shutil
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -18,6 +20,8 @@ import os
 
 # Global storage for active QR sessions
 active_qr_sessions = {}
+# Global storage for active drivers (to keep sessions alive)
+active_drivers = {}
 
 @frappe.whitelist()
 def generate_whatsapp_qr(session_id, timeout=30):
@@ -28,13 +32,30 @@ def generate_whatsapp_qr(session_id, timeout=30):
         # Check if we already have an active session
         if session_id in active_qr_sessions:
             session_data = active_qr_sessions[session_id]
-            if session_data.get('status') == 'qr_ready':
+            status = session_data.get('status')
+            
+            if status == 'qr_ready':
+                # Return latest QR code (may have been updated)
                 return {
                     'status': 'qr_generated',
                     'qr': session_data.get('qr_data'),
                     'session': session_id,
-                    'message': 'QR code ready for scanning'
+                    'message': 'QR code ready for scanning',
+                    'generated_at': session_data.get('generated_at')
                 }
+            elif status == 'connected':
+                return {
+                    'status': 'already_connected',
+                    'session': session_id,
+                    'message': 'WhatsApp is already connected',
+                    'connected_at': session_data.get('connected_at')
+                }
+            elif status == 'starting':
+                # Session is still starting, wait for it
+                pass
+            elif status == 'error':
+                # Previous session had error, clear it and start fresh
+                del active_qr_sessions[session_id]
         
         # Prepare site context and session directory on main thread
         try:
@@ -91,9 +112,11 @@ def generate_whatsapp_qr(session_id, timeout=30):
     except Exception as e:
         error_msg = str(e)
         frappe.log_error(f"WhatsApp QR Generation Error: {error_msg}", "WhatsApp Real QR")
-        # Clean up failed session
+        # Clean up failed session from memory
         if session_id in active_qr_sessions:
             del active_qr_sessions[session_id]
+        # Note: We don't delete the directory here as it might be useful for debugging
+        # User can manually call cleanup_session if needed
         raise Exception(error_msg)
 
 def start_qr_session(session_id, site_name=None, session_dir=None):
@@ -359,47 +382,28 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
         if not qr_element:
             raise Exception("QR code element not found with any selector")
         
-        # Prefer exact QR pixels from canvas to avoid scan issues
-        qr_data_url = None
-        try:
-            qr_data_url = driver.execute_script("""
-                const c = document.querySelector('[data-ref] canvas') || document.querySelector('canvas[aria-label*="QR"]') || document.querySelector('div[data-ref] canvas') || document.querySelector('canvas');
-                if (!c) return null;
-                try { return c.toDataURL('image/png'); } catch (e) { return null; }
-            """)
-        except Exception as js_err:
-            _safe_log(f"Canvas toDataURL failed: {str(js_err)}", "WhatsApp QR Canvas")
-
-        if not qr_data_url or not isinstance(qr_data_url, str) or not qr_data_url.startswith("data:image"):
-            # Fallback: screenshot and crop
-            location = qr_element.location
-            size = qr_element.size
-            padding = 20
-            left = max(0, location['x'] - padding)
-            top = max(0, location['y'] - padding)
-            width = size['width'] + (padding * 2)
-            height = size['height'] + (padding * 2)
-
-            screenshot = driver.get_screenshot_as_png()
-            image = Image.open(io.BytesIO(screenshot))
-            qr_image = image.crop((left, top, left + width, top + height)).convert('RGB')
-            buffer = io.BytesIO()
-            qr_image.save(buffer, format='PNG', quality=95)
-            img_str = base64.b64encode(buffer.getvalue()).decode()
-            qr_data_url = f"data:image/png;base64,{img_str}"
+        # Extract QR code directly from canvas with better accuracy
+        qr_data_url = _extract_qr_from_canvas(driver, qr_element)
+        
+        # Store driver reference to keep it alive
+        active_drivers[session_id] = driver
         
         # Update session status
         active_qr_sessions[session_id] = {
             'status': 'qr_ready',
             'qr_data': qr_data_url,
             'generated_at': time.time(),
-            'driver_active': True
+            'driver_active': True,
+            'session_dir': effective_session_dir if use_persistent_session else None
         }
         
         _safe_log(f"QR capture successful for session: {session_id}", "WhatsApp QR Success")
         
-        # Keep driver alive for a while to detect scan
-        monitor_qr_scan(driver, session_id)
+        # Keep driver alive and monitor for QR changes and connection
+        # Run monitor in a separate thread so it doesn't block
+        monitor_thread = threading.Thread(target=monitor_qr_scan, args=(driver, session_id, effective_session_dir))
+        monitor_thread.daemon = True
+        monitor_thread.start()
         
     except Exception as e:
         error_msg = str(e)
@@ -408,113 +412,251 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
             'status': 'error',
             'error': error_msg
         }
-    finally:
-        if driver:
+        # Clean up driver on error
+        if session_id in active_drivers:
+            try:
+                active_drivers[session_id].quit()
+            except:
+                pass
+            del active_drivers[session_id]
+        elif driver:
             try:
                 driver.quit()
             except:
                 pass
 
-def monitor_qr_scan(driver, session_id, timeout=300):
-    """Monitor for QR scan and connection"""
+def _extract_qr_from_canvas(driver, qr_element=None):
+    """Extract QR code directly from canvas with highest accuracy"""
+    try:
+        # Try to get QR from canvas using the most accurate method
+        qr_data_url = driver.execute_script("""
+            (function() {
+                // First, try to find the exact QR canvas with data-ref attribute
+                let canvas = document.querySelector('canvas[data-ref]');
+                
+                // If not found, try other selectors
+                if (!canvas) {
+                    canvas = document.querySelector('div[data-ref] canvas');
+                }
+                if (!canvas) {
+                    canvas = document.querySelector('canvas[aria-label*="QR"]');
+                }
+                if (!canvas) {
+                    // Last resort: find any canvas that might be QR
+                    const canvases = document.querySelectorAll('canvas');
+                    for (let c of canvases) {
+                        const rect = c.getBoundingClientRect();
+                        // QR codes are typically square and between 200-400px
+                        if (rect.width >= 200 && rect.height >= 200 && 
+                            Math.abs(rect.width - rect.height) < 50) {
+                            canvas = c;
+                            break;
+                        }
+                    }
+                }
+                
+                if (!canvas) return null;
+                
+                try {
+                    // Get canvas data as PNG with highest quality
+                    return canvas.toDataURL('image/png');
+                } catch (e) {
+                    console.error('Canvas toDataURL error:', e);
+                    return null;
+                }
+            })();
+        """)
+        
+        if qr_data_url and isinstance(qr_data_url, str) and qr_data_url.startswith("data:image"):
+            return qr_data_url
+        
+        # Fallback: screenshot method if canvas extraction fails
+        if qr_element:
+            try:
+                location = qr_element.location
+                size = qr_element.size
+                padding = 10  # Less padding for more accuracy
+                left = max(0, location['x'] - padding)
+                top = max(0, location['y'] - padding)
+                width = size['width'] + (padding * 2)
+                height = size['height'] + (padding * 2)
+
+                screenshot = driver.get_screenshot_as_png()
+                image = Image.open(io.BytesIO(screenshot))
+                qr_image = image.crop((left, top, left + width, top + height)).convert('RGB')
+                buffer = io.BytesIO()
+                qr_image.save(buffer, format='PNG', quality=100)  # Maximum quality
+                img_str = base64.b64encode(buffer.getvalue()).decode()
+                return f"data:image/png;base64,{img_str}"
+            except Exception as screenshot_err:
+                _safe_log(f"Screenshot fallback failed: {str(screenshot_err)}", "WhatsApp QR Extract")
+        
+        return None
+    except Exception as e:
+        _safe_log(f"QR extraction error: {str(e)}", "WhatsApp QR Extract")
+        return None
+
+def _keep_session_alive(driver, session_id, session_dir=None):
+    """Keep WhatsApp session alive after connection"""
+    try:
+        _safe_log(f"Starting session keep-alive for: {session_id}", "WhatsApp Keep-Alive")
+        
+        # Keep checking connection status periodically
+        check_interval = 30  # Check every 30 seconds
+        last_check = time.time()
+        
+        while session_id in active_drivers and session_id in active_qr_sessions:
+            try:
+                current_time = time.time()
+                
+                # Check connection status periodically
+                if current_time - last_check >= check_interval:
+                    last_check = current_time
+                    try:
+                        # Verify still connected
+                        chat_list = driver.find_elements(By.CSS_SELECTOR, '[data-testid="chat-list"]')
+                        if not chat_list:
+                            # Connection lost
+                            _safe_log(f"Connection lost for session: {session_id}", "WhatsApp Keep-Alive")
+                            active_qr_sessions[session_id] = {
+                                'status': 'disconnected',
+                                'message': 'WhatsApp connection lost',
+                                'session_dir': session_dir
+                            }
+                            break
+                        else:
+                            # Still connected, update last check time
+                            if active_qr_sessions[session_id].get('status') == 'connected':
+                                # Update connection time
+                                active_qr_sessions[session_id]['last_check'] = current_time
+                    except Exception as check_err:
+                        # Error checking connection - might be disconnected
+                        _safe_log(f"Error checking connection: {str(check_err)}", "WhatsApp Keep-Alive")
+                        # Don't break immediately - might be temporary
+                
+                # Sleep to avoid excessive CPU usage
+                time.sleep(10)
+                
+            except Exception as e:
+                _safe_log(f"Error in keep-alive loop: {str(e)}", "WhatsApp Keep-Alive")
+                time.sleep(10)
+        
+        _safe_log(f"Keep-alive thread ended for session: {session_id}", "WhatsApp Keep-Alive")
+        
+    except Exception as e:
+        _safe_log(f"Keep-alive error for session {session_id}: {str(e)}", "WhatsApp Keep-Alive")
+
+def _get_qr_hash(qr_data_url):
+    """Get a simple hash of QR data to detect changes"""
+    if not qr_data_url:
+        return None
+    try:
+        # Use first 1000 chars of base64 data as hash (enough to detect changes)
+        data_part = qr_data_url[22:1022] if len(qr_data_url) > 1022 else qr_data_url[22:]
+        return hashlib.md5(data_part.encode()).hexdigest()
+    except:
+        return None
+
+def monitor_qr_scan(driver, session_id, session_dir=None, timeout=600):
+    """Monitor for QR scan, connection, and QR code changes"""
     try:
         start_time = time.time()
+        last_qr_hash = None
+        qr_check_interval = 3  # Check QR every 3 seconds
+        connection_check_interval = 2  # Check connection every 2 seconds
+        last_qr_check = 0
+        last_connection_check = 0
+        
+        _safe_log(f"Starting QR monitor for session: {session_id}", "WhatsApp QR Monitor")
+        
         while time.time() - start_time < timeout:
-            try:
-                # Check if connected (chat list appears)
-                chat_list = driver.find_element(By.CSS_SELECTOR, '[data-testid="chat-list"]')
-                if chat_list:
-                    active_qr_sessions[session_id] = {
-                        'status': 'connected',
-                        'connected_at': time.time(),
-                        'message': 'Successfully connected to WhatsApp'
-                    }
-                    return
-            except:
-                pass
+            current_time = time.time()
             
-            # Check if QR expired or changed; if so, recapture and update session QR
-            try:
-                qr_element = driver.find_element(By.CSS_SELECTOR, '[data-ref] canvas')
-                if not qr_element:
-                    _safe_log("QR element missing, attempting recapture", "WhatsApp QR Monitor")
-                    _recapture_qr(driver, session_id)
-                    continue
-                # If element exists but may have been refreshed, try to fetch fresh pixels periodically
-                if int(time.time() - active_qr_sessions.get(session_id, {}).get('generated_at', 0)) >= 20:
-                    _safe_log("Refreshing QR (periodic refresh)", "WhatsApp QR Monitor")
-                    _recapture_qr(driver, session_id)
-            except Exception as qr_check_err:
-                _safe_log(f"QR check error, attempting recapture: {str(qr_check_err)}", "WhatsApp QR Monitor")
-                _recapture_qr(driver, session_id)
+            # Check for connection more frequently
+            if current_time - last_connection_check >= connection_check_interval:
+                last_connection_check = current_time
+                try:
+                    # Check if connected (multiple indicators)
+                    chat_list = driver.find_elements(By.CSS_SELECTOR, '[data-testid="chat-list"]')
+                    side_panel = driver.find_elements(By.CSS_SELECTOR, '[data-testid="sidebar"]')
+                    
+                    if chat_list or side_panel:
+                        # Connected! Update session and keep driver alive
+                        _safe_log(f"Connection detected for session: {session_id}", "WhatsApp Connection")
+                        active_qr_sessions[session_id] = {
+                            'status': 'connected',
+                            'connected_at': time.time(),
+                            'message': 'Successfully connected to WhatsApp',
+                            'session_dir': session_dir,
+                            'driver_active': True
+                        }
+                        # Don't quit driver - keep session alive
+                        # Driver will be kept in active_drivers dict
+                        # Start a thread to keep session alive and monitor connection
+                        keep_alive_thread = threading.Thread(
+                            target=_keep_session_alive, 
+                            args=(driver, session_id, session_dir)
+                        )
+                        keep_alive_thread.daemon = True
+                        keep_alive_thread.start()
+                        return
+                except Exception as conn_check_err:
+                    # Not connected yet, continue monitoring
+                    pass
             
-            time.sleep(2)
+            # Check for QR changes less frequently but regularly
+            if current_time - last_qr_check >= qr_check_interval:
+                last_qr_check = current_time
+                try:
+                    # Check if QR element exists and get current QR
+                    qr_elements = driver.find_elements(By.CSS_SELECTOR, '[data-ref] canvas')
+                    
+                    if qr_elements and len(qr_elements) > 0:
+                        # QR element exists, extract current QR
+                        qr_element = qr_elements[0]
+                        current_qr = _extract_qr_from_canvas(driver, qr_element)
+                        
+                        if current_qr:
+                            # Check if QR has changed by comparing hash
+                            current_hash = _get_qr_hash(current_qr)
+                            
+                            if current_hash and current_hash != last_qr_hash:
+                                # QR has changed, update session
+                                _safe_log(f"QR code updated for session: {session_id}", "WhatsApp QR Update")
+                                active_qr_sessions[session_id] = {
+                                    'status': 'qr_ready',
+                                    'qr_data': current_qr,
+                                    'generated_at': time.time(),
+                                    'driver_active': True,
+                                    'session_dir': session_dir
+                                }
+                                last_qr_hash = current_hash
+                    else:
+                        # QR element not found - might be connecting or expired
+                        # Wait a bit and check again
+                        time.sleep(1)
+                        
+                except Exception as qr_check_err:
+                    # Error checking QR, log and continue
+                    _safe_log(f"QR check error: {str(qr_check_err)}", "WhatsApp QR Monitor")
+            
+            # Sleep briefly to avoid excessive CPU usage
+            time.sleep(0.5)
+            
+        # Timeout reached
+        _safe_log(f"QR monitor timeout for session: {session_id}", "WhatsApp QR Monitor")
+        active_qr_sessions[session_id] = {
+            'status': 'timeout',
+            'message': 'QR scan timeout - please try again'
+        }
             
     except Exception as e:
         _safe_log(f"QR Monitor Error: {str(e)}", "WhatsApp QR Monitor")
-
-def _recapture_qr(driver, session_id):
-    """Recapture QR from current page and update session store"""
-    try:
-        # Wait for QR to be present again
-        wait = WebDriverWait(driver, 15)
-        qr_element = None
-        qr_selectors = [
-            '[data-ref] canvas',
-            'canvas[aria-label*="QR"]',
-            'div[data-ref] canvas',
-            'canvas'
-        ]
-        for selector in qr_selectors:
-            try:
-                qr_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                if qr_element and qr_element.size['width'] > 200 and qr_element.size['height'] > 200:
-                    break
-            except:
-                continue
-
-        if not qr_element:
-            raise Exception("Unable to locate QR element on recapture")
-
-        # Prefer canvas pixels; fallback to cropped screenshot
-        qr_data_url = None
-        try:
-            qr_data_url = driver.execute_script("""
-                const c = document.querySelector('[data-ref] canvas') || document.querySelector('canvas[aria-label*="QR"]') || document.querySelector('div[data-ref] canvas') || document.querySelector('canvas');
-                if (!c) return null;
-                try { return c.toDataURL('image/png'); } catch (e) { return null; }
-            """)
-        except Exception as js_err:
-            _safe_log(f"Canvas toDataURL (recapture) failed: {str(js_err)}", "WhatsApp QR Recapture")
-
-        if not qr_data_url or not isinstance(qr_data_url, str) or not qr_data_url.startswith("data:image"):
-            location = qr_element.location
-            size = qr_element.size
-            padding = 20
-            left = max(0, location['x'] - padding)
-            top = max(0, location['y'] - padding)
-            width = size['width'] + (padding * 2)
-            height = size['height'] + (padding * 2)
-            import io as _io
-            import base64 as _b64
-            from PIL import Image as _Image
-            screenshot = driver.get_screenshot_as_png()
-            image = _Image.open(_io.BytesIO(screenshot))
-            qr_image = image.crop((left, top, left + width, top + height)).convert('RGB')
-            buffer = _io.BytesIO()
-            qr_image.save(buffer, format='PNG', quality=95)
-            img_str = _b64.b64encode(buffer.getvalue()).decode()
-            qr_data_url = f"data:image/png;base64,{img_str}"
-
         active_qr_sessions[session_id] = {
-            'status': 'qr_ready',
-            'qr_data': qr_data_url,
-            'generated_at': time.time(),
-            'driver_active': True
+            'status': 'error',
+            'error': str(e)
         }
-        _safe_log("QR recaptured and session updated", "WhatsApp QR Recapture")
-    except Exception as rec_err:
-        _safe_log(f"QR recapture failed: {str(rec_err)}", "WhatsApp QR Recapture")
+
 
 def get_session_directory(session_id):
     """Get session directory for Chrome profile"""
@@ -533,18 +675,241 @@ def get_session_directory(session_id):
 
 @frappe.whitelist()
 def check_qr_status(session_id):
-    """Check status of QR generation"""
+    """Check status of QR generation and return latest QR if available"""
     if session_id in active_qr_sessions:
-        return active_qr_sessions[session_id]
+        session_data = active_qr_sessions[session_id].copy()
+        
+        # If QR is ready and we have a driver, try to get the latest QR
+        if session_data.get('status') == 'qr_ready' and session_id in active_drivers:
+            try:
+                driver = active_drivers[session_id]
+                # Try to get latest QR from page (non-blocking check)
+                qr_elements = driver.find_elements(By.CSS_SELECTOR, '[data-ref] canvas')
+                if qr_elements and len(qr_elements) > 0:
+                    latest_qr = _extract_qr_from_canvas(driver, qr_elements[0])
+                    if latest_qr:
+                        # Check if QR has actually changed
+                        current_hash = _get_qr_hash(latest_qr)
+                        old_hash = _get_qr_hash(session_data.get('qr_data'))
+                        if current_hash != old_hash:
+                            # QR has changed, update session
+                            session_data['qr_data'] = latest_qr
+                            session_data['generated_at'] = time.time()
+                            active_qr_sessions[session_id] = session_data
+            except Exception as e:
+                # If we can't get latest QR, return cached one
+                # Don't log as error since this is a frequent check
+                pass
+        
+        return session_data
     else:
         return {'status': 'not_found'}
 
+def _get_session_directory_path(session_id):
+    """Get session directory path without creating it"""
+    try:
+        private_files = frappe.get_site_path('private', 'files')
+        session_dir = os.path.join(private_files, 'whatsapp_sessions', session_id)
+        return session_dir
+    except Exception:
+        # Fallback: we can't determine the path, return None
+        return None
+
+def _delete_session_directory(session_id, retry_count=3):
+    """Delete session directory and all its contents"""
+    try:
+        # Get directory path without creating it
+        session_dir = _get_session_directory_path(session_id)
+        
+        if not session_dir:
+            _safe_log(f"Could not determine session directory path for {session_id}", "WhatsApp Session Cleanup")
+            return False
+        
+        # Check if directory exists
+        if not os.path.exists(session_dir):
+            return True  # Directory doesn't exist, consider it deleted
+        
+        # First, try to clean up lock files
+        lock_files_to_check = [
+            os.path.join(session_dir, "SingletonLock"),
+            os.path.join(session_dir, "SingletonSocket"),
+            os.path.join(session_dir, "SingletonCookie"),
+        ]
+        
+        default_profile = os.path.join(session_dir, "Default")
+        if os.path.exists(default_profile):
+            lock_files_to_check.extend([
+                os.path.join(default_profile, "SingletonLock"),
+                os.path.join(default_profile, "lockfile"),
+                os.path.join(default_profile, "LOCKFILE"),
+            ])
+        
+        # Remove lock files
+        for lock_path in lock_files_to_check:
+            if os.path.exists(lock_path):
+                try:
+                    if platform.system() == 'Windows':
+                        time.sleep(0.2)  # Wait longer on Windows
+                    os.remove(lock_path)
+                except Exception:
+                    pass  # Ignore lock file removal errors
+        
+        # Try to delete directory with retries
+        for attempt in range(retry_count):
+            try:
+                if platform.system() == 'Windows':
+                    # On Windows, use shutil.rmtree with error handler
+                    def handle_remove_readonly(func, path, exc):
+                        """Handle readonly files on Windows"""
+                        try:
+                            os.chmod(path, 0o777)
+                            func(path)
+                        except Exception:
+                            pass
+                    
+                    shutil.rmtree(session_dir, onerror=handle_remove_readonly)
+                else:
+                    shutil.rmtree(session_dir)
+                
+                _safe_log(f"Session directory deleted: {session_dir}", "WhatsApp Session Cleanup")
+                return True
+                
+            except PermissionError:
+                if attempt < retry_count - 1:
+                    time.sleep(0.5)  # Wait before retry
+                    continue
+                else:
+                    _safe_log(f"Could not delete session directory (locked): {session_dir}", "WhatsApp Session Cleanup")
+                    return False
+            except Exception as e:
+                _safe_log(f"Error deleting session directory: {str(e)}", "WhatsApp Session Cleanup")
+                if attempt < retry_count - 1:
+                    time.sleep(0.5)
+                    continue
+                return False
+        
+        return False
+        
+    except Exception as e:
+        _safe_log(f"Error in _delete_session_directory: {str(e)}", "WhatsApp Session Cleanup")
+        return False
+
 @frappe.whitelist()
-def cleanup_session(session_id):
-    """Clean up QR session"""
-    if session_id in active_qr_sessions:
-        del active_qr_sessions[session_id]
-    return {'success': True}
+def cleanup_session(session_id, delete_directory=True, close_driver=True):
+    """Clean up QR session from memory, close driver, and optionally delete session directory"""
+    try:
+        driver_closed = False
+        
+        # Close driver if requested and exists
+        if close_driver and session_id in active_drivers:
+            try:
+                driver = active_drivers[session_id]
+                driver.quit()
+                driver_closed = True
+                _safe_log(f"Driver closed for session: {session_id}", "WhatsApp Session Cleanup")
+            except Exception as driver_err:
+                _safe_log(f"Error closing driver for session {session_id}: {str(driver_err)}", "WhatsApp Session Cleanup")
+            finally:
+                del active_drivers[session_id]
+        
+        # Remove from active sessions
+        if session_id in active_qr_sessions:
+            del active_qr_sessions[session_id]
+            _safe_log(f"Session removed from memory: {session_id}", "WhatsApp Session Cleanup")
+        
+        # Delete session directory if requested
+        directory_deleted = False
+        if delete_directory:
+            deleted = _delete_session_directory(session_id)
+            directory_deleted = deleted
+            if deleted:
+                _safe_log(f"Session directory deleted for: {session_id}", "WhatsApp Session Cleanup")
+            else:
+                _safe_log(f"Could not delete session directory for: {session_id}", "WhatsApp Session Cleanup")
+        
+        return {
+            'success': True,
+            'message': f'Session {session_id} cleaned up successfully',
+            'driver_closed': driver_closed,
+            'directory_deleted': directory_deleted
+        }
+            
+    except Exception as e:
+        error_msg = str(e)
+        _safe_log(f"Error cleaning up session {session_id}: {error_msg}", "WhatsApp Session Cleanup")
+        return {
+            'success': False,
+            'error': error_msg
+        }
+
+@frappe.whitelist()
+def cleanup_old_sessions(older_than_days=7, delete_directories=True):
+    """Clean up old sessions that are no longer active"""
+    try:
+        cleaned_count = 0
+        deleted_dirs = 0
+        errors = []
+        
+        # Get all session directories
+        try:
+            private_files = frappe.get_site_path('private', 'files')
+            sessions_base_dir = os.path.join(private_files, 'whatsapp_sessions')
+            
+            if not os.path.exists(sessions_base_dir):
+                return {
+                    'success': True,
+                    'message': 'No sessions directory found',
+                    'cleaned_count': 0
+                }
+            
+            # Get current time
+            current_time = time.time()
+            cutoff_time = current_time - (older_than_days * 24 * 60 * 60)
+            
+            # Iterate through session directories
+            for session_id in os.listdir(sessions_base_dir):
+                session_dir = os.path.join(sessions_base_dir, session_id)
+                
+                if not os.path.isdir(session_dir):
+                    continue
+                
+                # Check if session is old
+                try:
+                    dir_mtime = os.path.getmtime(session_dir)
+                    if dir_mtime < cutoff_time:
+                        # Session is old, clean it up
+                        if session_id in active_qr_sessions:
+                            del active_qr_sessions[session_id]
+                            cleaned_count += 1
+                        
+                        if delete_directories:
+                            if _delete_session_directory(session_id):
+                                deleted_dirs += 1
+                            else:
+                                errors.append(f"Could not delete directory for session {session_id}")
+                except Exception as e:
+                    errors.append(f"Error processing session {session_id}: {str(e)}")
+            
+            return {
+                'success': True,
+                'cleaned_count': cleaned_count,
+                'deleted_directories': deleted_dirs,
+                'errors': errors if errors else None,
+                'message': f'Cleaned up {cleaned_count} old sessions, deleted {deleted_dirs} directories'
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+            
+    except Exception as e:
+        _safe_log(f"Error in cleanup_old_sessions: {str(e)}", "WhatsApp Session Cleanup")
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 @frappe.whitelist()
 def health_check_real():
