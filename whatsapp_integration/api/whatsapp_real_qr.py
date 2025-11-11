@@ -16,6 +16,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
+import re
 import os
 import urllib.parse
 
@@ -710,8 +711,17 @@ def check_qr_status(session_id):
         return session_data
     # Try to bootstrap status from persisted profile if not found in memory
     boot = _bootstrap_session_status(session_id)
-    if boot:
+    if boot and isinstance(boot, dict) and boot.get('status') != 'not_found':
         return boot
+    # Try alternative id without non-digits if primary not found
+    try:
+        alt = re.sub(r"\D", "", session_id or "")
+    except Exception:
+        alt = None
+    if alt and alt != session_id:
+        boot2 = _bootstrap_session_status(alt)
+        if boot2:
+            return boot2
     return {'status': 'not_found'}
 
 def _bootstrap_session_status(session_id):
@@ -722,9 +732,13 @@ def _bootstrap_session_status(session_id):
         service = ChromeService(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
         driver.get("https://web.whatsapp.com")
-        time.sleep(2)
+        time.sleep(5)
         try:
-            candidates = driver.find_elements(By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side']")
+            _try_click_use_here(driver)
+        except Exception:
+            pass
+        try:
+            candidates = driver.find_elements(By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']")
             if candidates and len(candidates) > 0:
                 active_drivers[session_id] = driver
                 active_qr_sessions[session_id] = {
@@ -1096,7 +1110,7 @@ def _ensure_driver_for_session(session_id):
             time.sleep(2)
             # Check if connected by locating chat list/sidebar
             wait = WebDriverWait(driver, 10)
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side']")))
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']")))
 
             # Mark connected in session map
             active_drivers[session_id] = driver
@@ -1127,3 +1141,27 @@ def _ensure_driver_for_session(session_id):
     except Exception as e:
         _safe_log(f"Ensure driver failed for {session_id}: {str(e)}", "WhatsApp Driver Ensure")
         return False
+
+def _try_click_use_here(driver):
+    """Attempt to click a 'Use here' takeover if present."""
+    try:
+        selectors = [
+            "[data-testid='use-here']",
+            "button[aria-label*='Use here']",
+            "button[aria-label*='Use Here']"
+        ]
+        for sel in selectors:
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                if els:
+                    try:
+                        els[0].click()
+                        time.sleep(1)
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
