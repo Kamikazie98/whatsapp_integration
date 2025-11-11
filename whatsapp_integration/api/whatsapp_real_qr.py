@@ -959,11 +959,14 @@ def send_message_persistent(session_id, phone_number, message):
     Requires that session_id exists in active_drivers (i.e., device linked and kept alive).
     """
     try:
+        # Ensure we have a live driver for this session (workers may differ per request)
         if session_id not in active_drivers:
-            return {
-                'success': False,
-                'error': 'Session not connected'
-            }
+            ensured = _ensure_driver_for_session(session_id)
+            if not ensured:
+                return {
+                    'success': False,
+                    'error': 'Session not connected'
+                }
 
         driver = active_drivers[session_id]
 
@@ -996,3 +999,63 @@ def send_message_persistent(session_id, phone_number, message):
             'success': False,
             'error': str(e)
         }
+
+def _ensure_driver_for_session(session_id):
+    """Ensure a Chrome driver is running and logged-in for the given session_id.
+
+    This handles cases where the QR was generated in a different worker/process and
+    active_drivers is empty in this process. If the persisted Chrome profile exists
+    and is logged in, we can reattach by starting a new headless driver with the
+    same user-data-dir and verifying the chat list.
+    """
+    try:
+        if session_id in active_drivers:
+            return True
+
+        # Build Chrome with the persisted user data dir
+        try:
+            session_dir = get_session_directory(session_id)
+        except Exception:
+            session_dir = None
+
+        chrome_options = _build_chrome_options(user_data_dir=session_dir)
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        try:
+            driver.get("https://web.whatsapp.com")
+            # small settle time
+            time.sleep(2)
+            # Check if connected by locating chat list/sidebar
+            wait = WebDriverWait(driver, 10)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='chat-list'], [data-testid='sidebar']")))
+
+            # Mark connected in session map
+            active_drivers[session_id] = driver
+            active_qr_sessions[session_id] = {
+                'status': 'connected',
+                'connected_at': time.time(),
+                'driver_active': True,
+                'session_dir': session_dir,
+            }
+
+            # Kick off keep-alive in background
+            try:
+                keep_alive_thread = threading.Thread(target=_keep_session_alive, args=(driver, session_id, session_dir))
+                keep_alive_thread.daemon = True
+                keep_alive_thread.start()
+            except Exception:
+                pass
+
+            return True
+        except Exception as e:
+            # Not connected with this profile
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            return False
+
+    except Exception as e:
+        _safe_log(f"Ensure driver failed for {session_id}: {str(e)}", "WhatsApp Driver Ensure")
+        return False

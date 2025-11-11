@@ -295,6 +295,11 @@ function show_qr_dialog(qr_data, device_number, frm) {
     });
 }
 
+// Ensure global access for inline onclick handlers
+if (typeof window !== 'undefined') {
+    window.show_qr_dialog = show_qr_dialog;
+}
+
 function display_qr_inline(frm) {
     // Handle different QR data formats
     let qr_src = frm.doc.qr_code;
