@@ -126,9 +126,10 @@ def _qr_hash(data_url: Optional[str]) -> Optional[str]:
     """Return a short hash of the QR data so we can detect refreshes."""
     if not data_url or not data_url.startswith("data:image"):
         return None
-    body = data_url[22:1022] if len(data_url) > 1022 else data_url[22:]
     try:
-        return hashlib.md5(body.encode()).hexdigest()
+        header_split = data_url.split(",", 1)
+        body = header_split[1] if len(header_split) == 2 else data_url[22:]
+        return hashlib.md5(body.encode("ascii", "ignore")).hexdigest()
     except Exception:
         return None
 
