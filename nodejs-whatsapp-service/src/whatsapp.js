@@ -157,3 +157,22 @@ export function getSessionStatus(sessionId) {
     return "Disconnected";
   }
 }
+
+export function listSessions() {
+  const ids = new Set([...Object.keys(sessions), ...Object.keys(qrCodes)]);
+  return Array.from(ids).map((id) => ({ session: id, status: getSessionStatus(id) }));
+}
+
+export function resetSession(sessionId) {
+  try {
+    const authPath = path.join(config.session_path, sessionId);
+    if (fs.existsSync(authPath)) {
+      fs.rmSync(authPath, { recursive: true, force: true });
+    }
+    delete sessions[sessionId];
+    delete qrCodes[sessionId];
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
+}
