@@ -418,28 +418,46 @@ if __name__ == "__main__":
 
 
 
+try:
+    from whatsapp_integration.api.whatsapp_playwright import generate_qr_base64  # اگر همین فایل است، مشکلی نیست
+except Exception:
+    pass  # در همین فایل تعریف شده
 
+def _run_async_compat(coro):
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        return asyncio.run(coro)
+    return asyncio.run(coro)
+
+@frappe.whitelist()
 def generate_whatsapp_qr_pw(
-    device_name: str = "default",
+    session_id: str,
+    timeout: int = 60,                 # ثانیه
     headless: int = 1,
     dump_dir: str = "/tmp/whatsapp_diag",
-    timeout: int | None = None,   # seconds; optional/legacy
 ):
     """
-    Legacy-compatible wrapper:
-    - Generates QR via Playwright
-    - Publishes realtime to UI
-    - Returns a dict: {"status": "ok", "b64": "..."} on success
-                      {"status": "error", "diag": "/path/to/png"} on failure
+    سازگار با نسخه‌های قبلی:
+    خروجی:
+        {"status":"qr_generated","qr":"data:image/png;base64,...","session":session_id}
+        یا {"status":"already_connected", ...}
+        یا {"status":"error","message": "...", "diag": "/path/to/png"}
     """
-    # translate timeout (sec) -> qr_timeout_ms
+    # نگاشت timeout -> میلی‌ثانیه برای هسته
     qr_timeout_ms = 90_000
-    if isinstance(timeout, (int, float)) and timeout > 0:
-        qr_timeout_ms = int(float(timeout) * 1000)
-
     try:
-        # مستقیماً هستهٔ async را صدا می‌زنیم تا diag هم داشته باشیم
-        data_url, diag = _run_async(
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            qr_timeout_ms = int(float(timeout) * 1000)
+    except Exception:
+        pass
+
+    # تلاش برای تولید QR
+    try:
+        data_url, diag = _run_async_compat(
             generate_qr_base64(
                 headless=bool(int(headless)),
                 dump_dir=dump_dir,
@@ -447,22 +465,60 @@ def generate_whatsapp_qr_pw(
             )
         )
     except Exception as e:
-        _log_error(
-            "PW generate error",
-            f"{e}\n\n{_ensure_playwright_installed_hint()}",
-        )
-        _publish_qr_event(device_name, "error", diag=None)
-        return {"status": "error", "diag": None}
+        # خطای Playwright / نصب
+        err = f"{e}"
+        try:
+            frappe.log_error("PW generate error", err[:2000])
+        except Exception:
+            pass
+        try:
+            frappe.publish_realtime(
+                event="whatsapp_qr",
+                message={"device": session_id, "status": "error", "diag": None},
+                user=frappe.session.user,
+            )
+        except Exception:
+            pass
+        return {"status": "error", "message": err, "diag": None, "session": session_id}
 
+    # اگر لاگین بود/QR نبود
     if not data_url:
-        # لاگ کوتاه تا از ۱۴۰ کاراکتر تجاوز نکند
-        _log_error("QR Generation Error", f"debug:{diag}")
-        _publish_qr_event(device_name, "error", diag=diag)
-        return {"status": "error", "diag": diag}
+        try:
+            frappe.log_error("QR Generation Error", f"debug:{diag}")
+        except Exception:
+            pass
+        try:
+            frappe.publish_realtime(
+                event="whatsapp_qr",
+                message={"device": session_id, "status": "error", "diag": diag},
+                user=frappe.session.user,
+            )
+        except Exception:
+            pass
+        return {
+            "status": "error",
+            "message": "QR not found (Playwright)",
+            "diag": diag,
+            "session": session_id,
+        }
 
-    # موفق: به UI publish و دیکشنری سازگار برگردان
-    _publish_qr_event(device_name, "ok", b64=data_url)
-    return {"status": "ok", "b64": data_url}
+    # موفقیت: انتشار به UI و برگرداندن دیکشنری مورد انتظار
+    try:
+        frappe.publish_realtime(
+            event="whatsapp_qr",
+            message={"device": session_id, "status": "qr_generated", "qr": data_url},
+            user=frappe.session.user,
+        )
+    except Exception:
+        # اگر publish نشد، فقط برگردان
+        pass
+
+    return {
+        "status": "qr_generated",       # با کدهای پایین‌دستی سازگار است
+        "qr": data_url,                 # کدها دنبال "qr" یا "qr_data" می‌گردند
+        "session": session_id,
+        "message": "QR code ready for scanning",
+    }
 # Public exports
 __all__ = [
     "generate_qr_base64",
