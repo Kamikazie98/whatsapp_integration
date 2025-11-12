@@ -1,0 +1,27 @@
+{
+ "add_total_row": 0,
+ "columns": [],
+ "creation": "2025-08-23 12:00:00.000000",
+ "disable_prepared_report": 0,
+ "filters": [
+  {
+    "fieldname": "from_date",
+    "label": "From Date",
+    "fieldtype": "Date",
+    "default": "Today-30"
+  },
+  {
+    "fieldname": "to_date",
+    "label": "To Date",
+    "fieldtype": "Date",
+    "default": "Today"
+  }
+ ],
+ "is_standard": "Yes",
+ "module": "Whatsapp Integration",
+ "name": "Campaign Leaderboard",
+ "owner": "Administrator",
+ "prepared_report": 0,
+ "ref_doctype": "WhatsApp Campaign",
+ "report_type": "Script Report"
+}

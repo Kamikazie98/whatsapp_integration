@@ -1,0 +1,95 @@
+{
+ "actions": [],
+ "creation": "2025-08-23 12:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "total_devices",
+  "messages_sent",
+  "messages_received",
+  "column_break_4",
+  "subscription_status",
+  "last_sync",
+  "section_break_7",
+  "messages_trend",
+  "device_usage"
+ ],
+ "fields": [
+  {
+   "fieldname": "total_devices",
+   "fieldtype": "Int",
+   "label": "Total Devices",
+   "read_only": 1
+  },
+  {
+   "fieldname": "messages_sent",
+   "fieldtype": "Int",
+   "label": "Messages Sent",
+   "read_only": 1
+  },
+  {
+   "fieldname": "messages_received",
+   "fieldtype": "Int",
+   "label": "Messages Received",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_4",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "subscription_status",
+   "fieldtype": "Data",
+   "label": "Subscription Status",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_sync",
+   "fieldtype": "Datetime",
+   "label": "Last Sync",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_7",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "messages_trend",
+   "fieldtype": "Code",
+   "hidden": 1,
+   "label": "Messages Trend Data"
+  },
+  {
+   "fieldname": "device_usage",
+   "fieldtype": "Code",
+   "hidden": 1,
+   "label": "Device Usage Data"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-08-23 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Whatsapp Integration",
+ "name": "WhatsApp Dashboard",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

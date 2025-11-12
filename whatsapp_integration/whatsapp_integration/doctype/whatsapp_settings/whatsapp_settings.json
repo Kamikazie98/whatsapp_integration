@@ -1,0 +1,89 @@
+{
+ "actions": [],
+ "creation": "2025-08-23 12:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "mode",
+  "section_break_2",
+  "nodejs_url",
+  "column_break_4",
+  "phone_number_id",
+  "access_token",
+  "verify_token"
+ ],
+ "fields": [
+  {
+   "fieldname": "mode",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Mode",
+   "options": "Unofficial\nOfficial",
+   "reqd": 1,
+   "description": "Choose WhatsApp integration mode: 'Unofficial' uses free WhatsApp Web via NodeJS service, 'Official' uses paid Meta Business API"
+  },
+  {
+   "fieldname": "section_break_2",
+   "fieldtype": "Section Break"
+  },
+  {
+   "depends_on": "eval:doc.mode=='Unofficial'",
+   "fieldname": "nodejs_url",
+   "fieldtype": "Data",
+   "label": "Legacy NodeJS API URL (Not Required)",
+   "description": "This field is no longer required. WhatsApp integration now uses Python service built into Frappe. You can leave this blank.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_4",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "eval:doc.mode=='Official'",
+   "fieldname": "phone_number_id",
+   "fieldtype": "Data",
+   "label": "Business Phone Number ID",
+   "description": "Get this from Meta Developer Console > WhatsApp > API Setup. Format: 123456789012345"
+  },
+  {
+   "depends_on": "eval:doc.mode=='Official'",
+   "fieldname": "access_token",
+   "fieldtype": "Password",
+   "label": "Meta Access Token",
+   "description": "Permanent access token from Meta Developer Console. Get from WhatsApp > API Setup > Access Token"
+  },
+  {
+   "depends_on": "eval:doc.mode=='Official'",
+   "fieldname": "verify_token",
+   "fieldtype": "Data",
+   "label": "Webhook Verify Token",
+   "description": "Custom token for webhook verification. Set same value in Meta Developer Console webhook configuration"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-08-23 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Whatsapp Integration",
+ "name": "WhatsApp Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
