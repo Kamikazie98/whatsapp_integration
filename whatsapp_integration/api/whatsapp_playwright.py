@@ -17,8 +17,10 @@ Features:
 from __future__ import annotations
 import asyncio
 import contextlib
+import hashlib
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -55,6 +57,14 @@ DEFAULT_USER_AGENT = (
 )
 
 DEFAULT_DUMP_DIR = "/tmp/whatsapp_diag"
+QR_MONITOR_SECS = 600  # keep refreshing QR for 10 minutes
+QR_REFRESH_INTERVAL = 3.0
+QR_WAIT_POLL_INTERVAL = 0.5
+
+_active_pw_threads: dict[str, threading.Thread] = {}
+_active_pw_stop: dict[str, threading.Event] = {}
+_active_pw_state: dict[str, dict] = {}
+_pw_lock = threading.Lock()
 
 # --------------- Small helpers ---------------
 async def _safe_write_text(path: Union[str, Path], text: str) -> None:
@@ -94,6 +104,43 @@ def _cache_clear(session_id: str) -> None:
         frappe.cache().delete_value(_cache_key(session_id))
     except Exception:
         pass
+
+
+def _qr_hash(data_url: Optional[str]) -> Optional[str]:
+    """Return a short hash of the QR data so we can detect refreshes."""
+    if not data_url or not data_url.startswith("data:image"):
+        return None
+    body = data_url[22:1022] if len(data_url) > 1022 else data_url[22:]
+    try:
+        return hashlib.md5(body.encode()).hexdigest()
+    except Exception:
+        return None
+
+
+def _store_status(
+    session_id: str,
+    status: str,
+    *,
+    qr: Optional[str] = None,
+    message: Optional[str] = None,
+    diag: Optional[str] = None,
+    publish: bool = False,
+    ttl: int = QR_MONITOR_SECS + 60,
+) -> dict:
+    """Persist the latest status in both in-memory map and frappe cache."""
+    payload = {"status": status, "session": session_id}
+    if qr:
+        payload["qr"] = qr
+        payload.setdefault("qr_data", qr)
+    if message:
+        payload["message"] = message
+    if diag:
+        payload["diag"] = diag
+    _active_pw_state[session_id] = payload
+    _cache_set(session_id, payload, ttl=ttl)
+    if publish:
+        _publish_qr_event(session_id, status, b64=qr, diag=diag)
+    return payload
 
 # --------------- Playwright core ---------------
 async def _is_logged_in(page) -> bool:
@@ -150,6 +197,16 @@ async def _try_extract_qr_dataurl(page, selector: str) -> Optional[str]:
             return b64
     except Exception:
         return None
+    return None
+
+
+async def _snapshot_qr_once(page) -> Optional[str]:
+    """Try every selector once to read the current QR as a data URL."""
+    for sel in QR_SELECTORS:
+        with contextlib.suppress(Exception):
+            data_url = await _try_extract_qr_dataurl(page, sel)
+            if data_url:
+                return data_url
     return None
 
 async def wait_for_qr(
@@ -222,6 +279,152 @@ async def generate_qr_base64(
             with contextlib.suppress(Exception): await context.close()
             with contextlib.suppress(Exception): await browser.close()
 
+
+# --------------- Background monitor for auto-refresh ---------------
+def _ensure_pw_monitor(
+    session_id: str,
+    *,
+    headless: bool,
+    dump_dir: Union[str, Path],
+    qr_timeout_ms: int,
+) -> None:
+    """Start a background Playwright session that keeps QR data fresh."""
+    with _pw_lock:
+        thread = _active_pw_threads.get(session_id)
+        if thread and thread.is_alive():
+            return
+
+        stop_event = threading.Event()
+        _active_pw_stop[session_id] = stop_event
+        thread = threading.Thread(
+            target=_pw_monitor_entry,
+            args=(session_id, stop_event, headless, str(dump_dir), qr_timeout_ms),
+            daemon=True,
+            name=f"wa-pw-monitor-{session_id}",
+        )
+        _active_pw_threads[session_id] = thread
+        _store_status(session_id, "starting", message="Launching Playwright session")
+        thread.start()
+
+
+def _pw_monitor_entry(
+    session_id: str,
+    stop_event: threading.Event,
+    headless: bool,
+    dump_dir: str,
+    qr_timeout_ms: int,
+) -> None:
+    try:
+        asyncio.run(
+            _pw_monitor_async(
+                session_id=session_id,
+                stop_event=stop_event,
+                headless=headless,
+                dump_dir=dump_dir,
+                qr_timeout_ms=qr_timeout_ms,
+            )
+        )
+    finally:
+        with _pw_lock:
+            _active_pw_threads.pop(session_id, None)
+            _active_pw_stop.pop(session_id, None)
+
+
+async def _pw_monitor_async(
+    *,
+    session_id: str,
+    stop_event: threading.Event,
+    headless: bool,
+    dump_dir: Union[str, Path],
+    qr_timeout_ms: int,
+) -> None:
+    """Long-lived Playwright session that refreshes QR when WhatsApp rotates it."""
+    from playwright.async_api import async_playwright
+
+    dump_dir = Path(dump_dir); dump_dir.mkdir(parents=True, exist_ok=True)
+    console_log_path = dump_dir / f"{session_id}_console.log"
+    chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    browser = context = page = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=headless, args=chromium_args)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=DEFAULT_USER_AGENT,
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+            page.on("console", lambda msg: asyncio.create_task(_append_line(console_log_path, msg.text())))
+
+            await page.goto(WHATSAPP_WEB_URL, wait_until="networkidle", timeout=120_000)
+            data_url, diag = await wait_for_qr(page, timeout_ms=qr_timeout_ms, dump_dir=dump_dir)
+            if stop_event.is_set():
+                return
+            if not data_url:
+                _store_status(
+                    session_id,
+                    "error",
+                    message="QR not found (Playwright)",
+                    diag=diag,
+                    publish=True,
+                )
+                return
+
+            last_hash = _qr_hash(data_url)
+            _store_status(session_id, "qr_generated", qr=data_url, message="QR code ready", publish=True)
+
+            monitor_deadline = time.time() + QR_MONITOR_SECS
+            misses = 0
+
+            while not stop_event.is_set():
+                if time.time() > monitor_deadline:
+                    break
+
+                with contextlib.suppress(Exception):
+                    if await _is_logged_in(page):
+                        _store_status(
+                            session_id,
+                            "connected",
+                            message="Successfully connected to WhatsApp",
+                            publish=True,
+                        )
+                        return
+
+                fresh_qr = await _snapshot_qr_once(page)
+                if fresh_qr:
+                    misses = 0
+                    fresh_hash = _qr_hash(fresh_qr)
+                    if fresh_hash and fresh_hash != last_hash:
+                        last_hash = fresh_hash
+                        monitor_deadline = time.time() + QR_MONITOR_SECS
+                        _store_status(
+                            session_id,
+                            "qr_generated",
+                            qr=fresh_qr,
+                            message="QR refreshed",
+                            publish=True,
+                        )
+                else:
+                    misses += 1
+                    if misses >= 5:
+                        with contextlib.suppress(Exception):
+                            await _logout_if_needed(page)
+                        misses = 0
+
+                await asyncio.sleep(QR_REFRESH_INTERVAL)
+    except Exception as exc:
+        _store_status(session_id, "error", message=str(exc), publish=True)
+    finally:
+        with contextlib.suppress(Exception):
+            if page:
+                await page.close()
+        with contextlib.suppress(Exception):
+            if context:
+                await context.close()
+        with contextlib.suppress(Exception):
+            if browser:
+                await browser.close()
+
 # --------------- Frappe integration ---------------
 def _run_async(coro):
     try:
@@ -246,10 +449,15 @@ def _publish_qr_event(session_id: str, status: str, *, b64: Optional[str] = None
     if not frappe:
         return
     try:
+        user = None
+        try:
+            user = getattr(getattr(frappe, "session", None), "user", None)
+        except Exception:
+            user = None
         frappe.publish_realtime(
             event="whatsapp_qr",
             message={"device": session_id, "status": status, "qr": b64, "diag": diag},
-            user=frappe.session.user,
+            user=user,
         )
     except Exception as e:
         _log_error("Realtime publish failed", str(e))
@@ -259,23 +467,25 @@ if frappe:
     @frappe.whitelist()
     def get_qr_data_url(device_name: str = "default", headless: int = 1, dump_dir: str = DEFAULT_DUMP_DIR) -> Optional[str]:
         """Generate QR and publish. Returns data-url string or None."""
-        try:
-            data_url, diag = _run_async(generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir))
-        except Exception as e:
-            _log_error("PW generate error", f"{e}")
-            _publish_qr_event(device_name, "error", diag=None)
-            _cache_set(device_name, {"status": "error", "diag": None, "session": device_name})
-            return None
-
-        if not data_url:
-            _log_error("QR Generation Error", f"debug:{diag}")
-            _publish_qr_event(device_name, "error", diag=diag)
-            _cache_set(device_name, {"status": "error", "diag": diag, "session": device_name})
-            return None
-
-        _publish_qr_event(device_name, "qr_generated", b64=data_url)
-        _cache_set(device_name, {"status": "qr_generated", "qr": data_url, "session": device_name})
-        return data_url
+        qr_timeout_ms = 90_000
+        _ensure_pw_monitor(
+            device_name,
+            headless=bool(int(headless)),
+            dump_dir=dump_dir,
+            qr_timeout_ms=qr_timeout_ms,
+        )
+        deadline = time.time() + max(qr_timeout_ms / 1000, 60)
+        while time.time() < deadline:
+            res = _cache_get(device_name)
+            if res:
+                status = res.get("status")
+                if status == "qr_generated" and res.get("qr"):
+                    return res["qr"]
+                if status == "error":
+                    return None
+            time.sleep(QR_WAIT_POLL_INTERVAL)
+        res = _cache_get(device_name) or {}
+        return res.get("qr")
 
 # --------------- Backward-compatible APIs ---------------
 if frappe:
@@ -297,27 +507,35 @@ if frappe:
         if isinstance(timeout, (int, float)) and timeout > 0:
             qr_timeout_ms = int(float(timeout) * 1000)
 
-        try:
-            data_url, diag = _run_async(
-                generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir, qr_timeout_ms=qr_timeout_ms)
-            )
-        except Exception as e:
-            msg = f"{e}"
-            _log_error("PW generate error", msg[:2000])
-            _publish_qr_event(session_id, "error", diag=None)
-            res = {"status": "error", "message": msg, "diag": None, "session": session_id}
-            _cache_set(session_id, res)
-            return res
+        _ensure_pw_monitor(
+            session_id,
+            headless=bool(int(headless)),
+            dump_dir=dump_dir,
+            qr_timeout_ms=qr_timeout_ms,
+        )
 
-        if not data_url:
-            _log_error("QR Generation Error", f"debug:{diag}")
-            _publish_qr_event(session_id, "error", diag=diag)
-            res = {"status": "error", "message": "QR not found (Playwright)", "diag": diag, "session": session_id}
-            _cache_set(session_id, res)
-            return res
+        wait_seconds = max(float(timeout), 5.0)
+        deadline = time.time() + wait_seconds
+        last_res = None
+        while time.time() < deadline:
+            res = _cache_get(session_id)
+            if res:
+                last_res = dict(res)
+                status = res.get("status")
+                if status in {"qr_generated", "error", "connected"}:
+                    return res
+            time.sleep(QR_WAIT_POLL_INTERVAL)
 
-        _publish_qr_event(session_id, "qr_generated", b64=data_url)
-        res = {"status": "qr_generated", "qr": data_url, "session": session_id, "message": "QR code ready"}
+        if last_res:
+            payload = dict(last_res)
+            payload.setdefault("message", f"QR generation still in progress after {int(wait_seconds)} seconds")
+            return payload
+
+        res = {
+            "status": "waiting",
+            "session": session_id,
+            "message": f"QR generation still in progress after {int(wait_seconds)} seconds",
+        }
         _cache_set(session_id, res)
         return res
 
@@ -333,16 +551,25 @@ if frappe:
         """
         res = _cache_get(session_id)
         if not res:
-            # nothing yet in cache → still waiting
             return {"status": "waiting", "session": session_id}
-        # normalize keys for older clients that use "qr_data"
-        if res.get("qr") and "qr_data" not in res:
-            res["qr_data"] = res["qr"]
-        return res
+        payload = dict(res)
+        if payload.get("qr") and "qr_data" not in payload:
+            payload["qr_data"] = payload["qr"]
+        return payload
 
     @frappe.whitelist()
     def clear_qr_status_pw(session_id: str) -> None:
         """Optional: clear cache after success or when starting over."""
+        thread = None
+        event = None
+        with _pw_lock:
+            event = _active_pw_stop.pop(session_id, None)
+            thread = _active_pw_threads.pop(session_id, None)
+        if event:
+            event.set()
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        _active_pw_state.pop(session_id, None)
         _cache_clear(session_id)
 
 # --------------- Optional CLI smoke test ---------------
