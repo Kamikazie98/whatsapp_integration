@@ -419,19 +419,28 @@ if __name__ == "__main__":
 
 
 
-def generate_whatsapp_qr_pw(device_name: str = "default", headless: int = 1, dump_dir: str = "/tmp/whatsapp_diag"):
+def generate_whatsapp_qr_pw(
+    device_name: str = "default",
+    headless: int = 1,
+    dump_dir: str = "/tmp/whatsapp_diag",
+    timeout: int | None = None,  # legacy param for backward compatibility
+):
     """
-    Legacy wrapper. Publishes realtime just like get_qr_data_url and
-    returns the data URL string on success, or None on failure.
+    Legacy wrapper for backward compatibility.
+    Accepts 'timeout' (ignored) so that older calls don't break.
+    Publishes realtime via get_qr_data_url.
     """
-    # If Frappe is available, reuse the whitelisted path that also publish_realtime
     if frappe:
+        # Reuse official path; ignore timeout param
         return get_qr_data_url(device_name=device_name, headless=headless, dump_dir=dump_dir)
 
-    # Fallback when frappe isn't present (e.g., CLI tests)
+    # Fallback for non-Frappe environments
     import asyncio
-    data_url, _diag = asyncio.run(generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir))
+    data_url, _diag = asyncio.run(
+        generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir)
+    )
     return data_url
+
 # Public exports
 __all__ = [
     "generate_qr_base64",
