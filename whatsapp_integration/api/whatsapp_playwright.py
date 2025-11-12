@@ -24,6 +24,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -70,6 +71,7 @@ _active_pw_state: dict[str, dict] = {}
 _active_pw_profiles: dict[str, Path] = {}
 _session_dump_dirs: dict[str, Path] = {}
 _session_user_hints: dict[str, Optional[str]] = {}
+_session_storage_files: dict[str, Path] = {}
 _pw_lock = threading.Lock()
 
 
@@ -185,9 +187,49 @@ def _store_status(
         payload["diag"] = diag
     _active_pw_state[session_id] = payload
     _cache_set(session_id, payload, ttl=ttl)
+    _sync_device_doc(session_id, payload)
     if publish:
         _publish_qr_event(session_id, status, b64=qr, diag=diag)
     return payload
+
+
+def _sync_device_doc(session_id: str, payload: dict) -> None:
+    if not frappe:
+        return
+    try:
+        if not frappe.db.exists("WhatsApp Device", session_id):
+            return
+        updates: dict[str, object] = {}
+        status = payload.get("status")
+        if status == "connected":
+            updates["status"] = "Connected"
+            try:
+                updates["last_sync"] = frappe.utils.now()
+            except Exception:
+                pass
+        elif status in {"qr_ready", "qr_generated"}:
+            updates["status"] = "QR Generated"
+            qr_data = payload.get("qr") or payload.get("qr_data")
+            if qr_data:
+                updates["qr_code"] = qr_data
+        elif status == "error":
+            updates["status"] = "Disconnected"
+        if updates:
+            frappe.db.set_value("WhatsApp Device", session_id, updates)
+    except Exception:
+        pass
+
+
+async def _persist_storage_state(context, session_id: str, dump_dir: Union[str, Path]) -> Optional[Path]:
+    """Persist current storage so other Playwright sessions can reuse the login."""
+    try:
+        target = _storage_state_path(session_id, dump_dir, ensure_parent=True)
+        await context.storage_state(path=str(target))
+        with _pw_lock:
+            _session_storage_files[session_id] = target
+        return target
+    except Exception:
+        return None
 
 
 def _profile_dir_path(session_id: str, dump_dir: Union[str, Path]) -> Path:
@@ -202,6 +244,23 @@ def _session_profile_dir(session_id: str, dump_dir: Union[str, Path]) -> Path:
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.mkdir(parents=True, exist_ok=True)
     return profile
+
+
+def _storage_state_path(
+    session_id: str,
+    dump_dir: Union[str, Path],
+    *,
+    ensure_parent: bool = False,
+) -> Path:
+    base = Path(dump_dir) / "storage_states"
+    if ensure_parent:
+        base.mkdir(parents=True, exist_ok=True)
+    safe = session_id.replace("/", "_").replace("\\", "_")
+    return base / f"{safe}.json"
+
+
+def _digits_only(phone: Optional[str]) -> str:
+    return "".join(ch for ch in (phone or "") if ch.isdigit())
 
 
 def _wait_for_status(
@@ -366,6 +425,109 @@ async def generate_qr_base64(
             with contextlib.suppress(Exception): await browser.close()
 
 
+async def _send_message_pw_async(
+    *,
+    session_id: str,
+    phone_number: str,
+    message: str,
+    dump_dir: Union[str, Path],
+    headless: bool,
+    timeout_s: int,
+) -> dict:
+    """Send a WhatsApp message using the saved Playwright storage state."""
+    from playwright.async_api import async_playwright
+
+    dest = _digits_only(phone_number)
+    if not dest:
+        return {"success": False, "error": "Invalid destination number"}
+
+    dump_dir = Path(dump_dir)
+    with _pw_lock:
+        state_path = _session_storage_files.get(session_id)
+    if not state_path:
+        state_path = _storage_state_path(session_id, dump_dir)
+    if not Path(state_path).exists():
+        return {"success": False, "error": "Device is not connected (storage missing)"}
+
+    chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    chat_url = (
+        f"{WHATSAPP_WEB_URL}send?"
+        f"phone={dest}&text={urllib.parse.quote(message or '', safe='')}"
+    )
+    timestamp = None
+    if frappe:
+        with contextlib.suppress(Exception):
+            timestamp = frappe.utils.now()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless, args=chromium_args)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=DEFAULT_USER_AGENT,
+            java_script_enabled=True,
+            storage_state=str(state_path),
+        )
+        page = await context.new_page()
+        try:
+            await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
+            if not await _is_logged_in(page):
+                return {"success": False, "error": "WhatsApp session not authenticated"}
+            send_selectors = [
+                "[data-testid='send']",
+                "button[aria-label='Send']",
+                "[data-testid='compose-btn-send']",
+            ]
+            for sel in send_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    await btn.wait_for(state="visible", timeout=timeout_s * 1000)
+                    await btn.click()
+                    break
+                except Exception:
+                    continue
+            else:
+                return {"success": False, "error": "Send button not found"}
+            await page.wait_for_timeout(1500)
+            if not timestamp:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+            return {
+                "success": True,
+                "message_id": f"{session_id}_{dest}_{int(time.time())}",
+                "timestamp": timestamp,
+            }
+        finally:
+            with contextlib.suppress(Exception): await page.close()
+            with contextlib.suppress(Exception): await context.close()
+            with contextlib.suppress(Exception): await browser.close()
+
+
+def send_message_pw(
+    session_id: str,
+    phone_number: str,
+    message: str,
+    *,
+    headless: int = 1,
+    dump_dir: str = DEFAULT_DUMP_DIR,
+    timeout: int = 30,
+) -> dict:
+    """Public API to send WhatsApp messages using Playwright session cookies."""
+    dump_path = _session_dump_dirs.get(session_id) or Path(dump_dir)
+    try:
+        return _run_async(
+            _send_message_pw_async(
+                session_id=session_id,
+                phone_number=phone_number,
+                message=message,
+                dump_dir=dump_path,
+                headless=bool(int(headless)),
+                timeout_s=int(timeout) if isinstance(timeout, (int, float)) else 30,
+            )
+        )
+    except Exception as exc:
+        _log_error("Playwright send failed", str(exc))
+        return {"success": False, "error": str(exc)}
+
+
 # --------------- Background monitor for auto-refresh ---------------
 def _ensure_pw_monitor(
     session_id: str,
@@ -503,6 +665,7 @@ async def _pw_monitor_async(
                     if await _is_logged_in(page):
                         if not connected:
                             connected = True
+                            await _persist_storage_state(context, session_id, dump_dir)
                             _store_status(
                                 session_id,
                                 "connected",
@@ -689,12 +852,14 @@ if frappe:
         event = None
         profile_dir: Optional[Path] = None
         dump_dir: Optional[Path] = None
+        storage_file: Optional[Path] = None
         with _pw_lock:
             event = _active_pw_stop.pop(session_id, None)
             thread = _active_pw_threads.pop(session_id, None)
             _session_user_hints.pop(session_id, None)
             profile_dir = _active_pw_profiles.pop(session_id, None)
             dump_dir = _session_dump_dirs.pop(session_id, None)
+            storage_file = _session_storage_files.pop(session_id, None)
         if event:
             event.set()
         if thread and thread.is_alive() and thread is not threading.current_thread():
@@ -706,6 +871,11 @@ if frappe:
             cleanup_path = _profile_dir_path(session_id, dump_dir)
         if cleanup_path:
             shutil.rmtree(cleanup_path, ignore_errors=True)
+        if not storage_file and dump_dir:
+            storage_file = _storage_state_path(session_id, dump_dir)
+        if storage_file:
+            with contextlib.suppress(Exception):
+                storage_file.unlink(missing_ok=True)
 
 # --------------- Optional CLI smoke test ---------------
 def _print(msg: str) -> None:
@@ -743,4 +913,5 @@ __all__ = [
     "generate_whatsapp_qr_pw",
     "check_qr_status_pw",
     "clear_qr_status_pw",
+    "send_message_pw",
 ]
