@@ -20,7 +20,7 @@ def _get_node_base_url():
     except Exception:
         pass
 
-    return "http://localhost:3001"
+    return "http://localhost:8001"
 
 class WhatsAppDevice(Document):
     @frappe.whitelist()
