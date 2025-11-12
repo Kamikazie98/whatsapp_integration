@@ -19,72 +19,72 @@ class WhatsAppDevice(Document):
             return {"success": False, "message": f"Error: {str(e)}"}
 
     @frappe.whitelist()
-    def check_connection_status(self):
-        """Check real WhatsApp connection status and sync DocType."""
-        try:
-            real_status = None
-            try:
-                from whatsapp_integration.api.whatsapp_real_qr import check_qr_status
-                real_status = check_qr_status(self.number)
-            except Exception:
-                real_status = None
+	def check_connection_status(self):
+		"""Check WhatsApp connection status using Playwright profile."""
+		try:
+			status_payload = None
+			try:
+				from whatsapp_integration.api.whatsapp_playwright import check_qr_status_pw
+				status_payload = check_qr_status_pw(self.number)
+			except Exception:
+				status_payload = None
 
-            if isinstance(real_status, dict):
-                st = real_status.get("status")
-                if st == "connected":
-                    if self.status != "Connected":
-                        self.status = "Connected"
-                        self.save()
-                    return {
-                        "status": "connected",
-                        "message": f"Device {self.number} is connected to WhatsApp",
-                        "device_number": self.number,
-                        "last_sync": self.last_sync
-                    }
-                if st in ("qr_ready", "starting"):
-                    if self.status != "QR Generated":
-                        self.status = "QR Generated"
-                        qr = real_status.get("qr") or real_status.get("qr_data")
-                        if qr:
-                            self.qr_code = qr
-                        self.save()
-                    return {
-                        "status": "qr_generated",
-                        "message": f"QR code generated for {self.number}. Please scan to connect.",
-                        "device_number": self.number
-                    }
-                if st in ("error", "not_found") and self.status != "Connected":
-                    if self.status != "Disconnected":
-                        self.status = "Disconnected"
-                        self.save()
+			if isinstance(status_payload, dict):
+				st = status_payload.get("status")
+				if st == "connected":
+					if self.status != "Connected":
+						self.status = "Connected"
+						self.save()
+					return {
+						"status": "connected",
+						"message": f"Device {self.number} is connected to WhatsApp",
+						"device_number": self.number,
+						"last_sync": self.last_sync
+					}
+				if st in ("qr_ready", "qr_generated"):
+					if self.status != "QR Generated":
+						self.status = "QR Generated"
+						qr = status_payload.get("qr") or status_payload.get("qr_data")
+						if qr:
+							self.qr_code = qr
+						self.save()
+					return {
+						"status": "qr_generated",
+						"message": f"QR code generated for {self.number}. Please scan to connect.",
+						"device_number": self.number
+					}
+				if st in ("error", "not_found") and self.status != "Connected":
+					if self.status != "Disconnected":
+						self.status = "Disconnected"
+						self.save()
 
-            if self.status == "Connected":
-                return {
-                    "status": "connected",
-                    "message": f"Device {self.number} is connected to WhatsApp",
-                    "device_number": self.number,
-                    "last_sync": self.last_sync
-                }
-            elif self.status == "QR Generated":
-                return {
-                    "status": "qr_generated",
-                    "message": f"QR code generated for {self.number}. Please scan to connect.",
-                    "device_number": self.number
-                }
-            else:
-                return {
-                    "status": "disconnected",
-                    "message": f"Device {self.number} is not connected. Generate QR code to connect.",
-                    "device_number": self.number
-                }
+			if self.status == "Connected":
+				return {
+					"status": "connected",
+					"message": f"Device {self.number} is connected to WhatsApp",
+					"device_number": self.number,
+					"last_sync": self.last_sync
+				}
+			elif self.status == "QR Generated":
+				return {
+					"status": "qr_generated",
+					"message": f"QR code generated for {self.number}. Please scan to connect.",
+					"device_number": self.number
+				}
+			else:
+				return {
+					"status": "disconnected",
+					"message": f"Device {self.number} is not connected. Generate QR code to connect.",
+					"device_number": self.number
+				}
 
-        except Exception as e:
-            frappe.log_error(f"Error checking connection status: {str(e)}", "WhatsApp Connection Status")
-            return {
-                "status": "error",
-                "message": f"Failed to check connection status: {str(e)}",
-                "device_number": self.number
-            }
+		except Exception as e:
+			frappe.log_error(f"Error checking connection status: {str(e)}", "WhatsApp Connection Status")
+			return {
+				"status": "error",
+				"message": f"Failed to check connection status: {str(e)}",
+				"device_number": self.number
+			}
 
     @frappe.whitelist()
     def check_connection(self):
@@ -125,76 +125,42 @@ class WhatsAppDevice(Document):
             frappe.msgprint("QR Code generation only works in Unofficial mode")
             return
         
-        try:
-            # Prefer the full real QR service first (keeps session alive and monitors scan)
-            try:
-                from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
-                frappe.msgprint("Generating WhatsApp QR (persistent session, first run may take up to 1-2 minutes)...")
-                result = generate_whatsapp_qr(self.number, timeout=90)
+		try:
+			from whatsapp_integration.api.whatsapp_playwright import generate_whatsapp_qr_pw
+			frappe.msgprint("Generating WhatsApp QR (Playwright, headless)...")
+			result = generate_whatsapp_qr_pw(self.number, timeout=90)
+			status = result.get("status")
+			if status in ("qr_generated", "qr_ready"):
+				self.qr_code = result.get("qr") or result.get("qr_data")
+				self.status = "QR Generated"
+				self.save()
+				frappe.msgprint(f"QR generated (Playwright) for {self.number}. Scan with your phone.")
+				return result
+			if status == "already_connected":
+				self.status = "Connected"
+				self.save()
+				frappe.msgprint(f"Device {self.number} is already connected!")
+				return result
+			if status == "error":
+				raise Exception(result.get("message"))
 
-                if result.get("status") == "qr_generated":
-                    self.qr_code = result.get("qr")
-                    self.status = "QR Generated"
-                    self.save()  # Save the document to persist QR data
-                    frappe.msgprint(f"QR generated for {self.number}. Scan with your phone to connect.")
-                    return result
-                elif result.get("status") == "already_connected":
-                    self.status = "Connected"
-                    self.save()  # Save the status update
-                    frappe.msgprint(f"Device {self.number} is already connected!")
-                    return result
-                elif result.get("status") in ("starting", "qr_ready"):
-                    # Session is starting or QR monitor has begun but payload didn't include QR yet
-                    # Mark as QR Generated so client JS starts polling live QR updates
-                    self.status = "QR Generated"
-                    # Save QR if present
-                    if result.get("qr"):
-                        self.qr_code = result.get("qr")
-                    self.save()
-                    frappe.msgprint("QR session started. Keep the dialog open; QR will update live.")
-                    return result
-                else:
-                    raise Exception("Persistent QR generation failed")
+			frappe.log_error(f"Unexpected Playwright QR response: {result}", "WhatsApp Device")
+			frappe.msgprint("Playwright QR did not succeed. Falling back to simple QR.")
 
-            except Exception as real_qr_error:
-                frappe.log_error(f"Persistent QR Generation Failed: {str(real_qr_error)}", "WhatsApp Device")
-                frappe.msgprint(f"Persistent QR failed: {str(real_qr_error)}. Trying quick method...")
+			from whatsapp_integration.api.whatsapp_simple import generate_simple_qr_code
+			simple = generate_simple_qr_code(self.number)
+			if simple.get("status") == "qr_generated":
+				self.qr_code = simple.get("qr")
+				self.status = "QR Generated"
+				self.save()
+				frappe.msgprint("Simple QR generated. Visit https://web.whatsapp.com manually to scan.")
+				return simple
+			error_msg = simple.get("message", "Failed to generate simple QR code")
+			frappe.throw(f"QR generation failed: {error_msg}")
 
-                # Fallback to quick QR (non-persistent; last resort before simple)
-                try:
-                    from whatsapp_integration.api.whatsapp_quick_qr import generate_quick_qr
-                    result = generate_quick_qr(self.number)
-
-                    if result.get("status") == "qr_generated":
-                        self.qr_code = result.get("qr")
-                        self.status = "QR Generated"
-                        self.save()  # Save the document to persist QR data
-                        frappe.msgprint(f"Quick QR generated for {self.number}. Scan with your phone!")
-                        return result
-                    else:
-                        raise Exception(result.get('message', 'Quick QR failed'))
-
-                except Exception as quick_qr_error:
-                    frappe.log_error(f"Quick QR Generation Failed: {str(quick_qr_error)}", "WhatsApp Device")
-                    frappe.msgprint(f"Quick QR failed: {str(quick_qr_error)}. Using simple fallback...")
-
-                    # Final fallback to simple QR generation
-                    from whatsapp_integration.api.whatsapp_simple import generate_simple_qr_code
-                    result = generate_simple_qr_code(self.number)
-
-                    if result.get("status") == "qr_generated":
-                        self.qr_code = result.get("qr")
-                        self.status = "QR Generated"
-                        self.save()  # Save the document to persist QR data
-                        frappe.msgprint("Simple QR generated. Visit https://web.whatsapp.com manually to scan.")
-                        return result
-                    else:
-                        error_msg = result.get("message", "Failed to generate simple QR code")
-                        frappe.throw(f"QR generation failed: {error_msg}")
-                
-        except Exception as e:
-            frappe.log_error(f"QR Generation Error: {str(e)}", "WhatsApp QR Generation")
-            frappe.throw(f"Error generating QR code: {str(e)}")
+		except Exception as e:
+			frappe.log_error(f"QR Generation Error: {str(e)}", "WhatsApp QR Generation")
+			frappe.throw(f"Error generating QR code: {str(e)}")
 
     def test_connection(self):
         """Test WhatsApp connection status"""
@@ -219,52 +185,52 @@ class WhatsAppDevice(Document):
         - starting   -> Status = QR Generated (UI continues polling)
         - not_found/error -> Status = Disconnected (if not already Connected)
         """
-        try:
-            status_payload = None
-            try:
-                from whatsapp_integration.api.whatsapp_real_qr import check_qr_status
-                status_payload = check_qr_status(self.number)
-            except Exception:
-                status_payload = None
+		try:
+			status_payload = None
+			try:
+				from whatsapp_integration.api.whatsapp_playwright import check_qr_status_pw
+				status_payload = check_qr_status_pw(self.number)
+			except Exception:
+				status_payload = None
 
-            updated = False
-            msg = None
+			updated = False
+			msg = None
 
-            if isinstance(status_payload, dict):
-                st = status_payload.get("status")
-                if st == "connected":
-                    if self.status != "Connected":
-                        self.status = "Connected"
-                        updated = True
-                    msg = "Device is connected."
-                elif st in ("qr_ready", "starting"):
-                    if self.status != "QR Generated":
-                        self.status = "QR Generated"
-                        updated = True
-                    qr = status_payload.get("qr") or status_payload.get("qr_data")
-                    if qr and self.qr_code != qr:
-                        self.qr_code = qr
-                        updated = True
-                    msg = "QR session active. Keep the dialog open."
-                elif st in ("error", "not_found"):
-                    if self.status != "Connected":
-                        self.status = "Disconnected"
-                        updated = True
-                    msg = f"Status: {st}"
+			if isinstance(status_payload, dict):
+				st = status_payload.get("status")
+				if st == "connected":
+					if self.status != "Connected":
+						self.status = "Connected"
+						updated = True
+					msg = "Device is connected."
+				elif st in ("qr_ready", "qr_generated"):
+					if self.status != "QR Generated":
+						self.status = "QR Generated"
+						updated = True
+					qr = status_payload.get("qr") or status_payload.get("qr_data")
+					if qr and self.qr_code != qr:
+						self.qr_code = qr
+						updated = True
+					msg = "QR session active. Keep the dialog open."
+				elif st in ("error", "not_found"):
+					if self.status != "Connected":
+						self.status = "Disconnected"
+						updated = True
+					msg = f"Status: {st}"
 
-            if updated:
-                self.save()
+			if updated:
+				self.save()
 
-            return {
-                "success": True,
-                "updated": updated,
-                "status": self.status,
-                "message": msg or "Status synced"
-            }
+			return {
+				"success": True,
+				"updated": updated,
+				"status": self.status,
+				"message": msg or "Status synced"
+			}
 
-        except Exception as e:
-            frappe.log_error(f"Sync Status Error: {str(e)}", "WhatsApp Device Sync")
-            return {"success": False, "message": f"Failed to sync status: {str(e)}"}
+		except Exception as e:
+			frappe.log_error(f"Sync Status Error: {str(e)}", "WhatsApp Device Sync")
+			return {"success": False, "message": f"Failed to sync status: {str(e)}"}
 
     @frappe.whitelist()
     def mark_connected(self):
@@ -288,21 +254,21 @@ def refresh_qr_code(device_name):
     try:
         device = frappe.get_doc("WhatsApp Device", device_name)
         
-        from whatsapp_integration.api.whatsapp_python import generate_qr_code
-        result = generate_qr_code(device.number)
+        from whatsapp_integration.api.whatsapp_playwright import generate_whatsapp_qr_pw
+        result = generate_whatsapp_qr_pw(device.number, timeout=90)
         
-        if result.get("status") == "qr_generated":
-            device.qr_code = result.get("qr")
+        if result.get("status") in ("qr_generated", "qr_ready"):
+            device.qr_code = result.get("qr") or result.get("qr_data")
             device.status = "QR Generated"
             device.save()
             return {"message": "QR Code refreshed successfully"}
-        elif result.get("status") == "already_connected":
+        if result.get("status") == "already_connected":
             device.status = "Connected"
             device.save()
             return {"message": "Device is already connected"}
-        else:
-            error_msg = result.get("message", "Failed to refresh QR code")
-            frappe.throw(f"QR refresh failed: {error_msg}")
+        
+        error_msg = result.get("message", "Failed to refresh QR code")
+        frappe.throw(f"QR refresh failed: {error_msg}")
             
     except Exception as e:
         frappe.log_error(f"QR Refresh Error: {str(e)}", "WhatsApp QR Refresh")

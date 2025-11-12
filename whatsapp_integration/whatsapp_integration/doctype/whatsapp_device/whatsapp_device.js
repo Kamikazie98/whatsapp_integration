@@ -266,7 +266,7 @@ function show_qr_dialog(qr_data, device_number, frm) {
     // Live update QR image every 3 seconds while dialog open
     const poll = () => {
         frappe.call({
-            method: 'whatsapp_integration.api.whatsapp_real_qr.check_qr_status',
+            method: 'whatsapp_integration.api.whatsapp_playwright.check_qr_status_pw',
             args: { session_id: device_number },
             callback: function(r) {
                 const data = r.message || {};
@@ -372,7 +372,7 @@ function setup_auto_refresh(frm) {
     frm.auto_refresh_timer = setInterval(function() {
         if (frm.doc.status === 'QR Generated') {
             frappe.call({
-                method: 'whatsapp_integration.api.whatsapp_real_qr.check_qr_status',
+                method: 'whatsapp_integration.api.whatsapp_playwright.check_qr_status_pw',
                 args: {
                     session_id: frm.doc.number
                 },

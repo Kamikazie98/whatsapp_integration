@@ -19,7 +19,7 @@ frappe.ui.form.on('WhatsApp Device', {
         if (!frm.doc.__islocal) {
             frm.add_custom_button(__('Check Status'), function() {
                 frappe.call({
-                    method: 'whatsapp_integration.api.whatsapp_real_qr.check_qr_status',
+                    method: 'whatsapp_integration.api.whatsapp_playwright.check_qr_status_pw',
                     args: {
                         session_id: frm.doc.number
                     },
@@ -91,7 +91,7 @@ function show_qr_dialog(qr_data, device_number, frm) {
         primary_action_label: __('Check Connection'),
         primary_action: function() {
             frappe.call({
-                method: 'whatsapp_integration.api.whatsapp_real_qr.check_qr_status',
+                method: 'whatsapp_integration.api.whatsapp_playwright.check_qr_status_pw',
                 args: {
                     session_id: device_number
                 },
@@ -154,7 +154,7 @@ function setup_auto_refresh(frm) {
     frm.auto_refresh_timer = setInterval(function() {
         if (frm.doc.status === 'QR Generated') {
             frappe.call({
-                method: 'whatsapp_integration.api.whatsapp_real_qr.check_qr_status',
+                method: 'whatsapp_integration.api.whatsapp_playwright.check_qr_status_pw',
                 args: {
                     session_id: frm.doc.number
                 },

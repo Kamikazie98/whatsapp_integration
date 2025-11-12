@@ -2,15 +2,14 @@ import frappe
 
 @frappe.whitelist()
 def add_device(session_name="default"):
-    """Generate QR via Python Selenium service and upsert device."""
+    """Generate QR via Playwright service and upsert device."""
     settings = frappe.get_doc("WhatsApp Settings")
     if settings.mode != "Unofficial":
         return {"error": "Add Device works only in Unofficial mode"}
 
-    from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
+    from whatsapp_integration.api.whatsapp_playwright import generate_whatsapp_qr_pw
 
-    # Allow enough time for first-time ChromeDriver download/startup
-    res = generate_whatsapp_qr(session_name, timeout=90)
+    res = generate_whatsapp_qr_pw(session_name, timeout=90)
 
     qr = res.get("qr") if isinstance(res, dict) else None
     status = res.get("status") if isinstance(res, dict) else None
