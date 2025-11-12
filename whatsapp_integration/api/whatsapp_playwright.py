@@ -15,6 +15,98 @@ from whatsapp_integration.api.whatsapp_real_qr import (
 )
 
 
+def _prepare_playwright_env() -> None:
+	"""Attempt to ensure Playwright can find a browser binary.
+
+	This helps when the app runs under a different user (e.g. root)
+	than the user who executed `playwright install`, by pointing
+	PLAYWRIGHT_BROWSERS_PATH to an existing cache if available.
+	"""
+	try:
+		# If already configured, leave as-is
+		if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+			return
+
+		candidates = []
+		# Current user's cache
+		candidates.append(os.path.expanduser("~/.cache/ms-playwright"))
+		# Common shared or system locations
+		candidates.extend([
+			"/ms-playwright",
+			"/usr/lib/ms-playwright",
+			"/usr/local/lib/ms-playwright",
+		])
+		# Known frappe user home on many benches
+		candidates.append("/home/frappe/.cache/ms-playwright")
+
+		for path in candidates:
+			try:
+				if path and os.path.isdir(path):
+					os.environ["PLAYWRIGHT_BROWSERS_PATH"] = path
+					_safe_log(f"PLAYWRIGHT_BROWSERS_PATH set to {path}", "WhatsApp PW Env")
+					return
+			except Exception:
+				pass
+	except Exception:
+		# Never fail due to env prep
+		pass
+
+
+def _launch_context_with_fallbacks(p, user_data_dir: str, headless: bool = True):
+	"""Launch a persistent context trying multiple strategies.
+
+	Order:
+	1) Use system Chrome channel if present.
+	2) Use default Playwright-managed Chromium.
+
+	If both fail, raise the last exception with guidance.
+	"""
+	common_args = [
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-gpu",
+		"--lang=en-US,en",
+		"--disable-blink-features=AutomationControlled",
+		"--window-size=1280,720",
+	]
+
+	last_err = None
+
+	# Attempt 1: Use system Chrome if installed
+	try:
+		return p.chromium.launch_persistent_context(
+			user_data_dir=user_data_dir,
+			headless=headless,
+			channel=os.environ.get("PLAYWRIGHT_CHANNEL", "chrome"),
+			args=common_args,
+			locale="en-US",
+		)
+	except Exception as e:
+		last_err = e
+		_safe_log(f"Playwright channel launch failed: {e}", "WhatsApp PW Launch")
+
+	# Attempt 2: Default bundled Chromium (requires `playwright install` for this user)
+	try:
+		return p.chromium.launch_persistent_context(
+			user_data_dir=user_data_dir,
+			headless=headless,
+			args=common_args,
+			locale="en-US",
+		)
+	except Exception as e:
+		last_err = e
+		_safe_log(f"Playwright default launch failed: {e}", "WhatsApp PW Launch")
+
+	# If we are here, provide actionable error
+	msg = (
+		"Playwright browser not found. Install browsers for the runtime user or "
+		"set PLAYWRIGHT_BROWSERS_PATH to a shared cache. Suggested commands: "
+		"`python -m playwright install --with-deps chromium` (as the SAME user running bench) "
+		"or install system Chrome and set `PLAYWRIGHT_CHANNEL=chrome`."
+	)
+	raise RuntimeError(f"{msg} Original error: {last_err}")
+
+
 def _resolve_user_data_dir(session_id: str) -> str:
 	try:
 		return get_session_directory(session_id)
@@ -62,21 +154,10 @@ def _extract_qr_from_page(page) -> str | None:
 def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 	"""Generate QR with Playwright (headless, persistent profile)."""
 	user_data_dir = _resolve_user_data_dir(session_id)
+	_prepare_playwright_env()
 	try:
 		with sync_playwright() as p:
-			browser = p.chromium.launch_persistent_context(
-				user_data_dir=user_data_dir,
-				headless=True,
-				args=[
-					"--no-sandbox",
-					"--disable-dev-shm-usage",
-					"--disable-gpu",
-					"--lang=en-US,en",
-					"--disable-blink-features=AutomationControlled",
-					"--window-size=1280,720",
-				],
-				locale="en-US",
-			)
+			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=True)
 			page = browser.new_page()
 			page.set_default_timeout(15000)
 			page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
@@ -124,14 +205,10 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 def check_qr_status_pw(session_id: str):
 	"""Check connection or refresh QR with Playwright using persisted profile."""
 	user_data_dir = _resolve_user_data_dir(session_id)
+	_prepare_playwright_env()
 	try:
 		with sync_playwright() as p:
-			browser = p.chromium.launch_persistent_context(
-				user_data_dir=user_data_dir,
-				headless=True,
-				args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--lang=en-US,en"],
-				locale="en-US",
-			)
+			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=True)
 			page = browser.new_page()
 			page.set_default_timeout(15000)
 			page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
@@ -169,6 +246,7 @@ def check_qr_status_pw(session_id: str):
 def send_message_pw(session_id: str, phone_number: str, message: str):
 	"""Send message via Playwright (requires linked device in this profile)."""
 	user_data_dir = _resolve_user_data_dir(session_id)
+	_prepare_playwright_env()
 	try:
 		dest = "".join(filter(str.isdigit, phone_number or ""))
 		if not dest:
@@ -177,12 +255,7 @@ def send_message_pw(session_id: str, phone_number: str, message: str):
 		chat_url = f"https://web.whatsapp.com/send?phone={dest}&text={text}"
 
 		with sync_playwright() as p:
-			browser = p.chromium.launch_persistent_context(
-				user_data_dir=user_data_dir,
-				headless=True,
-				args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--lang=en-US,en"],
-				locale="en-US",
-			)
+			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=True)
 			page = browser.new_page()
 			page.set_default_timeout(20000)
 			page.goto(chat_url, wait_until="domcontentloaded")
