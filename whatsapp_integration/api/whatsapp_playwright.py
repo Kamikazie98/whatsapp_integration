@@ -1,430 +1,425 @@
-import os
-import time
-import base64
-import io
-import urllib.parse
-import frappe
-from PIL import Image
-from playwright.sync_api import sync_playwright
+# whatsapp_integration/whatsapp_playwright.py
+# -*- coding: utf-8 -*-
+"""
+Robust WhatsApp Web QR extractor via Playwright.
+- Clears session/storage to force QR screen
+- Tries multiple selectors for QR (canvas/img)
+- Detects "already logged in" markers and resets
+- Returns data URL (data:image/png;base64,...) or saves diagnostics
+- Works headless by default; can run headful for debugging
+- Safe to import without Frappe; integrates if Frappe exists
 
-# Reuse session directory util from selenium path
-from whatsapp_integration.api.whatsapp_real_qr import (
-	_safe_log,
-	get_session_directory,
-	_get_qr_hash,
+Usage (Python):
+    from whatsapp_integration.whatsapp_playwright import generate_qr_base64
+    data_url, diag = asyncio.run(generate_qr_base64(headless=True))
+
+Usage (Frappe):
+    frappe.call("whatsapp_integration.whatsapp_playwright.get_qr_data_url", {})
+"""
+
+from __future__ import annotations
+import asyncio
+import contextlib
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional, Tuple, Union
+
+try:
+    # Optional: allow this module to be used outside Frappe
+    import frappe  # type: ignore
+except Exception:
+    frappe = None  # noqa
+
+# ---- Tunables ---------------------------------------------------------------
+
+QR_SELECTORS = [
+    'div[data-testid="qrcode"] canvas',
+    'canvas[aria-label="Scan me!"]',
+    'div[data-ref] canvas',               # older builds
+    'img[alt="Scan me!"]',                # sometimes img with data: src
+    'div[data-testid="qrcode"] img',      # fallback
+]
+
+LOGIN_MARKERS = [
+    'div[data-testid="chat-list-search"]',  # logged-in shell
+    'div[aria-label="Chat list"]',
+    'header[data-testid="chatlist-header"]',
+]
+
+WHATSAPP_WEB_URL = "https://web.whatsapp.com/"
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-
-def _prepare_playwright_env() -> None:
-	"""Attempt to ensure Playwright can find a browser binary.
-
-	This helps when the app runs under a different user (e.g. root)
-	than the user who executed `playwright install`, by pointing
-	PLAYWRIGHT_BROWSERS_PATH to an existing cache if available.
-	"""
-	try:
-		# If already configured, leave as-is
-		if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
-			return
-
-		candidates = []
-		# Linux/macOS common caches
-		candidates.append(os.path.expanduser("~/.cache/ms-playwright"))
-		candidates.extend([
-			"/ms-playwright",
-			"/usr/lib/ms-playwright",
-			"/usr/local/lib/ms-playwright",
-			"/home/frappe/.cache/ms-playwright",
-		])
-
-		# Windows common caches
-		try:
-			userprofile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-			if userprofile:
-				candidates.append(os.path.join(userprofile, "AppData", "Local", "ms-playwright"))
-		except Exception:
-			pass
-		try:
-			programdata = os.environ.get("PROGRAMDATA")
-			if programdata:
-				candidates.append(os.path.join(programdata, "ms-playwright"))
-		except Exception:
-			pass
-		# A simple conventional root path that admins may use
-		candidates.append("C:/ms-playwright")
-
-		for path in candidates:
-			try:
-				if path and os.path.isdir(path):
-					os.environ["PLAYWRIGHT_BROWSERS_PATH"] = path
-					_safe_log(f"PLAYWRIGHT_BROWSERS_PATH set to {path}", "WhatsApp PW Env")
-					return
-			except Exception:
-				pass
-	except Exception:
-		# Never fail due to env prep
-		pass
+# ----------------------------------------------------------------------------
 
 
-def _launch_context_with_fallbacks(p, user_data_dir: str, headless: bool = True):
-	"""Launch a persistent context trying multiple strategies.
-
-	Order:
-	1) Use system Chrome channel if present.
-	2) Use default Playwright-managed Chromium.
-
-	If both fail, raise the last exception with guidance.
-	"""
-	common_args = [
-		"--no-sandbox",
-		"--disable-dev-shm-usage",
-		"--disable-gpu",
-		"--lang=en-US,en",
-		"--disable-blink-features=AutomationControlled",
-		"--window-size=1280,720",
-	]
-	ua = os.environ.get(
-		"WHATSAPP_DESKTOP_UA",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-		"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	)
-
-	last_err = None
-
-	# Attempt 1: Use system Chrome if installed
-	try:
-		return p.chromium.launch_persistent_context(
-			user_data_dir=user_data_dir,
-			headless=headless,
-			channel=os.environ.get("PLAYWRIGHT_CHANNEL", "chrome"),
-			args=common_args,
-			locale="en-US",
-			user_agent=ua,
-		)
-	except Exception as e:
-		last_err = e
-		_safe_log(f"Playwright channel launch failed: {e}", "WhatsApp PW Launch")
-
-	# Attempt 1b (Windows): try Microsoft Edge channel
-	try:
-		if os.name == "nt":
-			return p.chromium.launch_persistent_context(
-				user_data_dir=user_data_dir,
-				headless=headless,
-				channel="msedge",
-				args=common_args,
-				locale="en-US",
-				user_agent=ua,
-			)
-	except Exception as e:
-		last_err = e
-		_safe_log(f"Playwright msedge launch failed: {e}", "WhatsApp PW Launch")
-
-	# Attempt 2: Default bundled Chromium (requires `playwright install` for this user)
-	try:
-		return p.chromium.launch_persistent_context(
-			user_data_dir=user_data_dir,
-			headless=headless,
-			args=common_args,
-			locale="en-US",
-			user_agent=ua,
-		)
-	except Exception as e:
-		last_err = e
-		_safe_log(f"Playwright default launch failed: {e}", "WhatsApp PW Launch")
-
-	# If we are here, provide actionable error
-	msg = (
-		"Playwright browser not found. Install browsers for the runtime user or "
-		"set PLAYWRIGHT_BROWSERS_PATH to a shared cache. Suggested commands: "
-		"`python -m playwright install --with-deps chromium` (as the SAME user running bench) "
-		"or install system Chrome and set `PLAYWRIGHT_CHANNEL=chrome`."
-	)
-	raise RuntimeError(f"{msg} Original error: {last_err}")
+async def _safe_write_text(path: Union[str, Path], text: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
 
 
-def _resolve_user_data_dir(session_id: str) -> str:
-	try:
-		return get_session_directory(session_id)
-	except Exception as e:
-		_safe_log(f"Playwright session dir fallback: {e}", "WhatsApp PW Session Dir")
-		import tempfile
-		return tempfile.mkdtemp(prefix=f"whatsapp_pw_{session_id}_")
+async def _append_line(path: Union[str, Path], line: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(line.rstrip("\n") + "\n")
 
 
-def _extract_qr_from_page(page) -> str | None:
-	try:
-		# Prefer exact canvas with data-ref
-		selectors = [
-			"canvas[data-ref]",
-			"div[data-ref] canvas",
-			"[data-testid='qrcode'] canvas",
-			"[data-testid='qrcode'] > canvas",
-			"canvas[aria-label*='QR']",
-			".landing-window canvas",
-			".landing-wrapper canvas",
-			".landing-window [role='img'] canvas",
-		]
-		canvas = None
-		for sel in selectors:
-			canvas = page.query_selector(sel)
-			if canvas:
-				break
-		if not canvas:
-			# Fallback: any square-ish canvas
-			for c in page.query_selector_all("canvas"):
-				box = c.bounding_box() or {}
-				w = box.get("width") or 0
-				h = box.get("height") or 0
-				if w >= 180 and h >= 180 and abs(w - h) < 60:
-					canvas = c
-					break
-		if canvas:
-			# Try direct toDataURL via DOM
-			data_url = page.evaluate(
-				"""(c)=>{ try { return c.toDataURL('image/png'); } catch(e){ return null; } }""",
-				canvas,
-			)
-			if isinstance(data_url, str) and data_url.startswith("data:image"):
-				return data_url
-			# Fallback: crop screenshot
-			box = canvas.bounding_box()
-			if box:
-				shot = page.screenshot(clip=box)
-				img = Image.open(io.BytesIO(shot)).convert("RGB")
-				buf = io.BytesIO()
-				img.save(buf, format="PNG", quality=100)
-				return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
-	except Exception as e:
-		_safe_log(f"Playwright QR extract failed: {e}", "WhatsApp PW QR")
-	return None
+async def _logout_if_needed(page) -> None:
+    """
+    Attempt to force QR screen by clearing storages.
+    """
+    # Clear storages inside the page context
+    await page.context.clear_cookies()
+    # Clear all storages (local/session/indexedDB)
+    await page.evaluate(
+        """
+        () => {
+          try { localStorage.clear(); } catch(e) {}
+          try { sessionStorage.clear(); } catch(e) {}
+          try {
+            if (window.indexedDB && indexedDB.databases) {
+              return indexedDB.databases().then(dbs => {
+                dbs.forEach(db => { try { indexedDB.deleteDatabase(db.name); } catch(e) {} });
+              });
+            }
+          } catch(e) {}
+          return null;
+        }
+        """
+    )
+    # Navigate fresh
+    await page.goto(WHATSAPP_WEB_URL, wait_until="networkidle")
 
 
-def _maybe_dismiss_and_reload_qr(page) -> None:
-	"""Best-effort: close interstitials and refresh QR if a control is present."""
-	try:
-		# Cookie/intro prompts
-		for sel in [
-			"button:has-text('Use Here')",
-			"button:has-text('Continue')",
-			"button:has-text('OK')",
-			"button:has-text('Accept')",
-			"[data-testid='accept']",
-		]:
-			el = page.query_selector(sel)
-			if el:
-				el.click()
-				time.sleep(0.3)
-	except Exception:
-		pass
-	# Try to reload QR if such a button exists
-	for sel in [
-		"[aria-label*='reload QR']",
-		"[aria-label*='Reload']",
-		"[data-testid*='refresh']",
-		"button:has-text('Reload')",
-		"button:has-text('Refresh')",
-		"span:has-text('Click to reload QR code')",
-	]:
-		try:
-			btn = page.query_selector(sel)
-			if btn:
-				btn.click()
-				time.sleep(0.5)
-				break
-		except Exception:
-			pass
+async def _is_logged_in(page) -> bool:
+    for marker in LOGIN_MARKERS:
+        try:
+            if await page.locator(marker).first.is_visible():
+                return True
+        except Exception:
+            pass
+    return False
 
 
-@frappe.whitelist()
-def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
-	"""Generate QR with Playwright (headless, persistent profile)."""
-	user_data_dir = _resolve_user_data_dir(session_id)
-	_prepare_playwright_env()
-	try:
-		with sync_playwright() as p:
-			# Allow headful debug via env: WHATSAPP_PW_HEADLESS=0 or 'false'
-			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
-			headless = not (h_env in {"0", "false", "no"})
-			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
-			page = browser.new_page()
-			page.set_default_timeout(15000)
-			page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
-			# quick settle
-			time.sleep(2)
-			# extra settle for heavy first load
-			try:
-				page.wait_for_load_state("networkidle", timeout=15000)
-			except Exception:
-				pass
+async def _try_extract_qr_dataurl(page, selector: str) -> Optional[str]:
+    """
+    If selector points to a visible QR (canvas or data: img), return data URL string.
+    """
+    elt = page.locator(selector).first
+    if not await elt.is_visible():
+        return None
 
-			# Handle occasional interstitials/cookie prompts quietly
-			_maybe_dismiss_and_reload_qr(page)
-
-			# Already connected?
-			if page.query_selector("[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']"):
-				browser.close()
-				return {
-					"status": "already_connected",
-					"session": session_id,
-					"message": "WhatsApp session already connected",
-				}
-
-			# Find QR
-			start = time.time()
-			qr_data = None
-			# Try waiting for QR containers or any viable canvas
-			wait_targets = [
-				"[data-testid='qrcode'] canvas",
-				"div[data-ref] canvas",
-				"canvas[data-ref]",
-				".landing-window canvas",
-				"canvas",
-			]
-			for sel in wait_targets:
-				try:
-					page.wait_for_selector(sel, state="visible", timeout=5000)
-					break
-				except Exception:
-					pass
-			while time.time() - start < timeout:
-				_maybe_dismiss_and_reload_qr(page)
-				qr_data = _extract_qr_from_page(page)
-				if qr_data:
-					break
-				time.sleep(0.5)
-
-			if not qr_data:
-				# Capture diagnostic screenshot
-				diag_path = None
-				try:
-					shot = page.screenshot(full_page=True)
-					diag_dir = _resolve_user_data_dir(f"diag_{session_id}")
-					os.makedirs(diag_dir, exist_ok=True)
-					diag_path = os.path.join(diag_dir, f"whatsapp_qr_not_found_{int(time.time())}.png")
-					with open(diag_path, "wb") as f:
-						f.write(shot)
-					_safe_log(f"QR not found; saved screenshot at {diag_path}", "WhatsApp PW QR")
-				except Exception as diag_err:
-					_safe_log(f"Failed to save diagnostic screenshot: {diag_err}", "WhatsApp PW QR")
-				browser.close()
-				raise Exception(f"QR element not found (PW){' | debug:' + diag_path if diag_path else ''}")
-
-			# Keep browser context alive briefly so user can scan
-			# We don't block here; client can poll status
-			return {
-				"status": "qr_ready",
-				"qr": qr_data,
-				"qr_data": qr_data,
-				"session": session_id,
-				"message": "WhatsApp QR (Playwright) generated",
-				"session_dir": user_data_dir,
-			}
-	except Exception as e:
-		_safe_log(f"PW generate error: {e}", "WhatsApp PW QR")
-		return {"status": "error", "message": str(e), "session": session_id}
+    # Evaluate in-page to extract from canvas or data:img
+    try:
+        b64 = await page.evaluate(
+            """
+            (sel) => {
+              const el = document.querySelector(sel);
+              if (!el) return null;
+              if (el.tagName === 'CANVAS' && el.toDataURL) {
+                try { return el.toDataURL('image/png'); } catch(e) { return null; }
+              }
+              if (el.tagName === 'IMG') {
+                const src = el.getAttribute('src') || '';
+                if (src.startsWith('data:')) return src;
+              }
+              return null;
+            }
+            """,
+            selector,
+        )
+        if isinstance(b64, str) and b64.startswith("data:image"):
+            return b64
+    except Exception:
+        return None
+    return None
 
 
-@frappe.whitelist()
-def check_qr_status_pw(session_id: str):
-	"""Check connection or refresh QR with Playwright using persisted profile."""
-	user_data_dir = _resolve_user_data_dir(session_id)
-	_prepare_playwright_env()
-	try:
-		with sync_playwright() as p:
-			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
-			headless = not (h_env in {"0", "false", "no"})
-			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
-			page = browser.new_page()
-			page.set_default_timeout(15000)
-			page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
-			time.sleep(2)
-			try:
-				page.wait_for_load_state("networkidle", timeout=15000)
-			except Exception:
-				pass
+async def wait_for_qr(
+    page,
+    *,
+    timeout_ms: int = 90_000,
+    poll_ms: int = 1_250,
+    dump_dir: Union[str, Path] = "/tmp/whatsapp_diag",
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Try to detect and extract QR as data URL within timeout.
+    If fails, take diagnostics (screenshot + html) and return (None, diag_path).
+    """
+    start = time.time()
+    while (time.time() - start) * 1000 < timeout_ms:
+        # If we are logged in already, clear session to force QR
+        with contextlib.suppress(Exception):
+            if await _is_logged_in(page):
+                await _logout_if_needed(page)
 
-			if page.query_selector("[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']"):
-				browser.close()
-				return {
-					"status": "connected",
-					"session": session_id,
-					"message": "WhatsApp session already connected",
-				}
+        # Try multiple selectors
+        for sel in QR_SELECTORS:
+            data_url = await _try_extract_qr_dataurl(page, sel)
+            if data_url:
+                return data_url, None
 
-			_maybe_dismiss_and_reload_qr(page)
-			qr = _extract_qr_from_page(page)
-			browser.close()
-			if qr:
-				return {
-					"status": "qr_ready",
-					"qr": qr,
-					"qr_data": qr,
-					"session": session_id,
-					"message": "QR available - scan to connect",
-				}
-			return {"status": "not_found", "session": session_id, "message": "QR not found in current session"}
-	except Exception as e:
-		_safe_log(f"PW status error: {e}", "WhatsApp PW QR")
-		return {
-			"status": "error",
-			"message": str(e),
-			"session": session_id,
-		}
+        # Sometimes QR is behind a loader; small wait
+        await asyncio.sleep(poll_ms / 1000.0)
+
+    # Diagnostics on failure
+    diag_dir = Path(dump_dir)
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    png_path = str(diag_dir / "whatsapp_qr_not_found.png")
+    html_path = str(diag_dir / "whatsapp_qr_not_found.html")
+
+    with contextlib.suppress(Exception):
+        await page.screenshot(path=png_path, full_page=True)
+    with contextlib.suppress(Exception):
+        html = await page.content()
+        # Avoid giant files; keep useful chunk
+        await _safe_write_text(html_path, html[:200_000])
+
+    return None, png_path
 
 
-@frappe.whitelist()
-def send_message_pw(session_id: str, phone_number: str, message: str):
-	"""Send message via Playwright (requires linked device in this profile)."""
-	user_data_dir = _resolve_user_data_dir(session_id)
-	_prepare_playwright_env()
-	try:
-		dest = "".join(filter(str.isdigit, phone_number or ""))
-		if not dest:
-			return {"success": False, "error": "Invalid destination number"}
-		text = urllib.parse.quote(message or "")
-		chat_url = f"https://web.whatsapp.com/send?phone={dest}&text={text}"
+async def generate_qr_base64(
+    *,
+    headless: bool = True,
+    user_agent: Optional[str] = None,
+    dump_dir: Union[str, Path] = "/tmp/whatsapp_diag",
+    nav_timeout_ms: int = 120_000,
+    qr_timeout_ms: int = 90_000,
+    proxy: Optional[dict] = None,
+    extra_browser_args: Optional[list] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Launch Chromium, navigate to WhatsApp Web, and extract QR as a data URL.
 
-		with sync_playwright() as p:
-			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
-			headless = not (h_env in {"0", "false", "no"})
-			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
-			page = browser.new_page()
-			page.set_default_timeout(20000)
-			page.goto(chat_url, wait_until="domcontentloaded")
-			# wait send button
-			page.wait_for_selector("[data-testid='send']")
-			page.click("[data-testid='send']")
-			browser.close()
-			return {
-				"success": True,
-				"message_id": f"{session_id}_{dest}_{int(time.time())}",
-				"timestamp": frappe.utils.now(),
-			}
-	except Exception as e:
-		_safe_log(f"PW send error: {e}", "WhatsApp PW Send")
-		return {"success": False, "error": str(e)}
+    Returns:
+        (data_url, diag_path)
+        - data_url: str like "data:image/png;base64,..." on success
+        - diag_path: path to PNG screenshot with "qr_not_found" on failure (None on success)
+
+    Params:
+        headless: run headless browser
+        user_agent: override UA string
+        dump_dir: directory for diagnostics (console logs, html, screenshots)
+        nav_timeout_ms: navigation timeout to WhatsApp Web
+        qr_timeout_ms: time budget to find QR
+        proxy: Playwright proxy dict, e.g. {"server": "http://host:port", "username": "...", "password": "..."}
+        extra_browser_args: list of extra Chromium args
+    """
+    from playwright.async_api import async_playwright  # local import to avoid hard dep on import time
+
+    dump_dir = Path(dump_dir)
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    console_log_path = dump_dir / "console.log"
+
+    # Prepare launch args (helpful for containers)
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+    ]
+    if extra_browser_args:
+        chromium_args.extend(extra_browser_args)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=chromium_args,
+            proxy=proxy,
+        )
+
+        ctx_kwargs = dict(
+            viewport={"width": 1280, "height": 900},
+            user_agent=user_agent or DEFAULT_USER_AGENT,
+            java_script_enabled=True,
+            # storage_state not provided: we want clean session
+        )
+        if proxy:
+            # When using proxy, ensure consistent UA
+            ctx_kwargs["user_agent"] = user_agent or DEFAULT_USER_AGENT
+
+        context = await browser.new_context(**ctx_kwargs)
+        page = await context.new_page()
+
+        # Capture console for diagnostics
+        page.on(
+            "console",
+            lambda msg: asyncio.create_task(_append_line(console_log_path, msg.text())),
+        )
+
+        try:
+            await page.goto(WHATSAPP_WEB_URL, wait_until="networkidle", timeout=nav_timeout_ms)
+            data_url, diag = await wait_for_qr(
+                page,
+                timeout_ms=qr_timeout_ms,
+                dump_dir=dump_dir,
+            )
+            return data_url, diag
+        finally:
+            with contextlib.suppress(Exception):
+                await context.close()
+            with contextlib.suppress(Exception):
+                await browser.close()
 
 
-@frappe.whitelist()
-def health_check_playwright():
-	"""Lightweight readiness probe for Playwright-based service."""
-	try:
-		with sync_playwright() as p:
-			browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-			browser.new_page().close()
-			browser.close()
-		return {
-			"status": "Playwright service ready",
-			"headless": True,
-			"timestamp": frappe.utils.now(),
-		}
-	except Exception as e:
-		_safe_log(f"Playwright health check failed: {e}", "WhatsApp PW Health")
-		return {
-			"status": "Playwright health check failed",
-			"error": str(e),
-			"timestamp": frappe.utils.now(),
-		}
+# -------------------- Frappe Integration Helpers -----------------------------
+
+def _log_error(title: str, detail: str) -> None:
+    if frappe is None:
+        # fallback to stderr
+        sys.stderr.write(f"[ERROR] {title}\n{detail}\n")
+        return
+    # Frappe truncates title to 140 chars; keep it short and useful
+    safe_title = (title or "Error")[:140]
+    try:
+        frappe.log_error(safe_title, detail)
+    except Exception:
+        # As a last resort
+        sys.stderr.write(f"[FRAPPE LOG ERROR FAILED] {safe_title}\n{detail}\n")
 
 
+def _publish_qr_event(
+    device_name: str,
+    status: str,
+    *,
+    b64: Optional[str] = None,
+    diag: Optional[str] = None,
+    user: Optional[str] = None,
+    event_name: str = "whatsapp_qr",
+) -> None:
+    """
+    Publish realtime event to Desk.
+    """
+    if frappe is None:
+        return
+    try:
+        frappe.publish_realtime(
+            event=event_name,
+            message={"device": device_name, "status": status, "b64": b64, "diag": diag},
+            user=user or frappe.session.user,
+        )
+    except Exception as e:
+        _log_error("Realtime publish failed", str(e))
+
+
+def _ensure_playwright_installed_hint() -> str:
+    return (
+        "Make sure Playwright and browsers are installed:\n"
+        "  pip install playwright\n"
+        "  playwright install chromium\n"
+        "Also ensure OS deps for headless Chromium are present.\n"
+    )
+
+
+# Whitelisted method for Frappe (sync wrapper around async)
+def _run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        # If running within an existing event loop (rare in Frappe), create a new one in a thread
+        return asyncio.run(coro)  # safest fallback in our context
+    return asyncio.run(coro)
+
+
+if frappe:
+    try:
+        from frappe.model.document import Document  # noqa
+    except Exception:
+        pass
+
+    @frappe.whitelist()
+    def get_qr_data_url(
+        device_name: str = "default",
+        headless: int = 1,
+        dump_dir: str = "/tmp/whatsapp_diag",
+    ) -> Optional[str]:
+        """
+        Frappe callable: generates QR and publishes it via realtime.
+        Returns data URL on success; None on failure (check diag/logs).
+        """
+        try:
+            data_url, diag = _run_async(
+                generate_qr_base64(
+                    headless=bool(int(headless)),
+                    dump_dir=dump_dir,
+                )
+            )
+        except Exception as e:
+            _log_error(
+                "PW generate error",
+                f"{e}\n\n{_ensure_playwright_installed_hint()}",
+            )
+            _publish_qr_event(device_name, "error", diag=None)
+            return None
+
+        if not data_url:
+            _log_error(
+                "QR Generation Error: QR element not found (PW)",
+                f"debug:{diag}",
+            )
+            _publish_qr_event(device_name, "error", diag=diag)
+            return None
+
+        # Publish to UI (preferred: send base64 directly)
+        _publish_qr_event(device_name, "ok", b64=data_url)
+        return data_url
+
+
+# ------------------------------- CLI -----------------------------------------
+
+def _print(msg: str) -> None:
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+
+def main_cli(argv: list[str]) -> int:
+    """
+    Minimal CLI for smoke testing:
+        python -m whatsapp_integration.whatsapp_playwright [--headful] [--dump /tmp/diag]
+    """
+    headless = True
+    dump_dir = "/tmp/whatsapp_diag"
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--headful", "--no-headless"):
+            headless = False
+        elif argv[i] in ("--dump", "--dump-dir") and i + 1 < len(argv):
+            dump_dir = argv[i + 1]
+            i += 1
+        i += 1
+
+    _print(f"Launching Playwright (headless={headless}) …")
+    try:
+        data_url, diag = asyncio.run(generate_qr_base64(headless=headless, dump_dir=dump_dir))
+    except Exception as e:
+        _print("ERROR: " + str(e))
+        _print(_ensure_playwright_installed_hint())
+        return 2
+
+    if data_url:
+        _print("QR extracted successfully (data URL).")
+        # For terminal brevity, don't print the whole data URL
+        _print("Preview (first 100 chars): " + data_url[:100] + " …")
+        return 0
+    else:
+        _print("Failed to find QR. Diagnostics saved at: " + str(diag))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main_cli(sys.argv[1:]))
+
+
+# Public exports
+__all__ = [
+    "generate_qr_base64",
+    "wait_for_qr",
+    "get_qr_data_url",
+]
