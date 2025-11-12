@@ -2,6 +2,14 @@ import frappe
 from frappe.model.document import Document
 
 class WhatsAppDevice(Document):
+	def _update_fields(self, values):
+		"""Persist given values to DB without version conflicts and update in-memory doc."""
+		if not values:
+			return
+		frappe.db.set_value(self.doctype, self.name, values)
+		for key, val in values.items():
+			setattr(self, key, val)
+
     @frappe.whitelist()
     def mark_connected(self):
         """Manually mark device as connected (for testing)"""
@@ -33,8 +41,7 @@ class WhatsAppDevice(Document):
 				st = status_payload.get("status")
 				if st == "connected":
 					if self.status != "Connected":
-						self.status = "Connected"
-						self.save()
+						self._update_fields({"status": "Connected"})
 					return {
 						"status": "connected",
 						"message": f"Device {self.number} is connected to WhatsApp",
@@ -43,11 +50,11 @@ class WhatsAppDevice(Document):
 					}
 				if st in ("qr_ready", "qr_generated"):
 					if self.status != "QR Generated":
-						self.status = "QR Generated"
 						qr = status_payload.get("qr") or status_payload.get("qr_data")
+						update_dict = {"status": "QR Generated"}
 						if qr:
-							self.qr_code = qr
-						self.save()
+							update_dict["qr_code"] = qr
+						self._update_fields(update_dict)
 					return {
 						"status": "qr_ready" if st == "qr_ready" else "qr_generated",
 						"message": f"QR code generated for {self.number}. Please scan to connect.",
@@ -56,8 +63,7 @@ class WhatsAppDevice(Document):
 					}
 				if st in ("error", "not_found") and self.status != "Connected":
 					if self.status != "Disconnected":
-						self.status = "Disconnected"
-						self.save()
+						self._update_fields({"status": "Disconnected"})
 
 			if self.status == "Connected":
 				return {
@@ -132,14 +138,14 @@ class WhatsAppDevice(Document):
 			result = generate_whatsapp_qr_pw(self.number, timeout=90)
 			status = result.get("status")
 			if status in ("qr_generated", "qr_ready"):
-				self.qr_code = result.get("qr") or result.get("qr_data")
-				self.status = "QR Generated"
-				self.save()
+				self._update_fields({
+					"qr_code": result.get("qr") or result.get("qr_data"),
+					"status": "QR Generated"
+				})
 				frappe.msgprint(f"QR generated (Playwright) for {self.number}. Scan with your phone.")
 				return result
 			if status == "already_connected":
-				self.status = "Connected"
-				self.save()
+				self._update_fields({"status": "Connected"})
 				frappe.msgprint(f"Device {self.number} is already connected!")
 				return result
 			if status == "error":
@@ -151,9 +157,10 @@ class WhatsAppDevice(Document):
 			from whatsapp_integration.api.whatsapp_simple import generate_simple_qr_code
 			simple = generate_simple_qr_code(self.number)
 			if simple.get("status") == "qr_generated":
-				self.qr_code = simple.get("qr")
-				self.status = "QR Generated"
-				self.save()
+				self._update_fields({
+					"qr_code": simple.get("qr"),
+					"status": "QR Generated"
+				})
 				frappe.msgprint("Simple QR generated. Visit https://web.whatsapp.com manually to scan.")
 				return simple
 			error_msg = simple.get("message", "Failed to generate simple QR code")
@@ -201,26 +208,23 @@ class WhatsAppDevice(Document):
 				st = status_payload.get("status")
 				if st == "connected":
 					if self.status != "Connected":
-						self.status = "Connected"
+						self._update_fields({"status": "Connected"})
 						updated = True
 					msg = "Device is connected."
 				elif st in ("qr_ready", "qr_generated"):
 					if self.status != "QR Generated":
-						self.status = "QR Generated"
+						self._update_fields({"status": "QR Generated"})
 						updated = True
 					qr = status_payload.get("qr") or status_payload.get("qr_data")
 					if qr and self.qr_code != qr:
-						self.qr_code = qr
+						self._update_fields({"qr_code": qr})
 						updated = True
 					msg = "QR session active. Keep the dialog open."
 				elif st in ("error", "not_found"):
 					if self.status != "Connected":
-						self.status = "Disconnected"
+						self._update_fields({"status": "Disconnected"})
 						updated = True
 					msg = f"Status: {st}"
-
-			if updated:
-				self.save()
 
 			return {
 				"success": True,
@@ -259,13 +263,13 @@ def refresh_qr_code(device_name):
         result = generate_whatsapp_qr_pw(device.number, timeout=90)
         
         if result.get("status") in ("qr_generated", "qr_ready"):
-            device.qr_code = result.get("qr") or result.get("qr_data")
-            device.status = "QR Generated"
-            device.save()
+            frappe.db.set_value("WhatsApp Device", device.name, {
+                "qr_code": result.get("qr") or result.get("qr_data"),
+                "status": "QR Generated"
+            })
             return {"message": "QR Code refreshed successfully"}
         if result.get("status") == "already_connected":
-            device.status = "Connected"
-            device.save()
+            frappe.db.set_value("WhatsApp Device", device.name, {"status": "Connected"})
             return {"message": "Device is already connected"}
         
         error_msg = result.get("message", "Failed to refresh QR code")
