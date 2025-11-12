@@ -69,6 +69,11 @@ def _launch_context_with_fallbacks(p, user_data_dir: str, headless: bool = True)
 		"--disable-blink-features=AutomationControlled",
 		"--window-size=1280,720",
 	]
+	ua = os.environ.get(
+		"WHATSAPP_DESKTOP_UA",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+		"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	)
 
 	last_err = None
 
@@ -80,6 +85,7 @@ def _launch_context_with_fallbacks(p, user_data_dir: str, headless: bool = True)
 			channel=os.environ.get("PLAYWRIGHT_CHANNEL", "chrome"),
 			args=common_args,
 			locale="en-US",
+			user_agent=ua,
 		)
 	except Exception as e:
 		last_err = e
@@ -92,6 +98,7 @@ def _launch_context_with_fallbacks(p, user_data_dir: str, headless: bool = True)
 			headless=headless,
 			args=common_args,
 			locale="en-US",
+			user_agent=ua,
 		)
 	except Exception as e:
 		last_err = e
@@ -119,14 +126,25 @@ def _resolve_user_data_dir(session_id: str) -> str:
 def _extract_qr_from_page(page) -> str | None:
 	try:
 		# Prefer exact canvas with data-ref
-		canvas = page.query_selector("canvas[data-ref]") or page.query_selector("div[data-ref] canvas")
+		selectors = [
+			"canvas[data-ref]",
+			"div[data-ref] canvas",
+			"[data-testid='qrcode'] canvas",
+			"canvas[aria-label*='QR']",
+			".landing-window canvas",
+		]
+		canvas = None
+		for sel in selectors:
+			canvas = page.query_selector(sel)
+			if canvas:
+				break
 		if not canvas:
 			# Fallback: any square-ish canvas
 			for c in page.query_selector_all("canvas"):
 				box = c.bounding_box() or {}
 				w = box.get("width") or 0
 				h = box.get("height") or 0
-				if w >= 200 and h >= 200 and abs(w - h) < 50:
+				if w >= 180 and h >= 180 and abs(w - h) < 60:
 					canvas = c
 					break
 		if canvas:
@@ -160,9 +178,24 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=True)
 			page = browser.new_page()
 			page.set_default_timeout(15000)
-			page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
+			page.goto("https://web.whatsapp.com", wait_until="networkidle")
 			# quick settle
 			time.sleep(2)
+
+			# Handle occasional interstitials/cookie prompts quietly
+			for sel in [
+				"button:has-text('Use Here')",
+				"button:has-text('Continue')",
+				"button:has-text('OK')",
+				"button:has-text('Accept')",
+			]:
+				try:
+					el = page.query_selector(sel)
+					if el:
+						el.click()
+						time.sleep(0.5)
+				except Exception:
+					pass
 
 			# Already connected?
 			if page.query_selector("[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']"):
@@ -176,6 +209,13 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 			# Find QR
 			start = time.time()
 			qr_data = None
+			# Try waiting briefly for common QR containers
+			for sel in ["[data-testid='qrcode'] canvas", "div[data-ref] canvas", "canvas[data-ref]"]:
+				try:
+					page.wait_for_selector(sel, state="visible", timeout=5000)
+					break
+				except Exception:
+					pass
 			while time.time() - start < timeout:
 				qr_data = _extract_qr_from_page(page)
 				if qr_data:
@@ -183,6 +223,17 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 				time.sleep(0.5)
 
 			if not qr_data:
+				# Capture diagnostic screenshot
+				try:
+					shot = page.screenshot(full_page=True)
+					diag_dir = _resolve_user_data_dir(f"diag_{session_id}")
+					os.makedirs(diag_dir, exist_ok=True)
+					shot_path = os.path.join(diag_dir, f"whatsapp_qr_not_found_{int(time.time())}.png")
+					with open(shot_path, "wb") as f:
+						f.write(shot)
+					_safe_log(f"QR not found; saved screenshot at {shot_path}", "WhatsApp PW QR")
+				except Exception as diag_err:
+					_safe_log(f"Failed to save diagnostic screenshot: {diag_err}", "WhatsApp PW QR")
 				browser.close()
 				raise Exception("QR element not found (PW)")
 
