@@ -44,6 +44,8 @@ export async function startSession(sessionId) {
       auth: state,
       printQRInTerminal: false,
       browser: ["Chrome", "Linux", "120.0.0"],
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
     });
 
     sock.ev.on("connection.update", async (update) => {
