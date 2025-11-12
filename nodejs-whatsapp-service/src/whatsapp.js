@@ -21,9 +21,15 @@ function normalizeSessionId(id) {
 
 let sessions = {};
 let qrCodes = {};
+const starting = new Set(); // prevent concurrent startSession per sid
+const backoffUntil = new Map(); // sid -> timestamp ms when next attempt is allowed
 
 export async function getQR(sessionId) {
   const sid = normalizeSessionId(sessionId);
+  const until = backoffUntil.get(sid) || 0;
+  if (Date.now() < until) {
+    return "QR code not available";
+  }
   if (qrCodes[sid]) {
     return qrCodes[sid];
   }
@@ -41,8 +47,16 @@ export async function startSession(sessionId) {
   if (sessions[sid]) {
     return "Session already active";
   }
+  if (starting.has(sid)) {
+    return "Session starting";
+  }
+  const until = backoffUntil.get(sid) || 0;
+  if (Date.now() < until) {
+    return "Backoff in effect";
+  }
   try {
     console.log(`Starting session for ${sid}`);
+    starting.add(sid);
 
     if (typeof makeWASocket !== "function") {
       console.error("makeWASocket is not a function. Baileys import failed.");
@@ -93,17 +107,20 @@ export async function startSession(sessionId) {
             }
             delete sessions[sid];
             delete qrCodes[sid];
+            // impose backoff to avoid rapid re-pair attempts the phone may reject
+            backoffUntil.set(sid, Date.now() + 60_000);
           }
         } catch (e) {
           console.error("Failed clearing session directory:", e);
         }
         // Always drop the in-memory session handle so restart can proceed
         delete sessions[sid];
-        const delay = deviceRemoved || loggedOut ? 3000 : 800;
+        const delay = deviceRemoved || loggedOut ? 5000 : 1500;
         setTimeout(() => startSession(sid), delay);
       } else if (connection === "open") {
         console.log(`WhatsApp session ${sid} connected`);
         delete qrCodes[sid];
+        backoffUntil.delete(sid);
       }
     });
 
@@ -140,6 +157,9 @@ export async function startSession(sessionId) {
   } catch (error) {
     console.error(`Failed to start session ${sessionId}:`, error);
     throw error;
+  }
+  finally {
+    starting.delete(sid);
   }
 }
 
