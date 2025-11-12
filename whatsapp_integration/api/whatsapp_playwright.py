@@ -1,20 +1,17 @@
-# whatsapp_integration/whatsapp_playwright.py
 # -*- coding: utf-8 -*-
 """
-Robust WhatsApp Web QR extractor via Playwright.
-- Clears session/storage to force QR screen
-- Tries multiple selectors for QR (canvas/img)
-- Detects "already logged in" markers and resets
-- Returns data URL (data:image/png;base64,...) or saves diagnostics
-- Works headless by default; can run headful for debugging
-- Safe to import without Frappe; integrates if Frappe exists
+WhatsApp Web QR via Playwright (Unofficial) — Final, backward-compatible.
 
-Usage (Python):
-    from whatsapp_integration.whatsapp_playwright import generate_qr_base64
-    data_url, diag = asyncio.run(generate_qr_base64(headless=True))
-
-Usage (Frappe):
-    frappe.call("whatsapp_integration.whatsapp_playwright.get_qr_data_url", {})
+Features:
+- Robust QR extraction (multiple selectors, storage reset)
+- Headless-friendly (container flags included)
+- Realtime publish to Desk (event='whatsapp_qr')
+- Backward-compatible wrappers:
+    - generate_whatsapp_qr_pw(session_id, timeout, headless, dump_dir) -> dict
+    - check_qr_status_pw(session_id) -> dict
+- Simple API:
+    - get_qr_data_url(device_name, headless, dump_dir) -> str|None
+- Status cache in frappe.cache() for polling
 """
 
 from __future__ import annotations
@@ -26,58 +23,89 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
+# ---- Failsafe: ensure Playwright browsers path & HOME are correct for bench ----
+os.environ.setdefault("HOME", "/home/frappe")
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/home/frappe/.cache/ms-playwright")
+
 try:
-    # Optional: allow this module to be used outside Frappe
     import frappe  # type: ignore
 except Exception:
-    frappe = None  # noqa
+    frappe = None  # allows local CLI runs
 
-# ---- Tunables ---------------------------------------------------------------
+# ---------------- Tunables ----------------
+WHATSAPP_WEB_URL = "https://web.whatsapp.com/"
 
 QR_SELECTORS = [
     'div[data-testid="qrcode"] canvas',
     'canvas[aria-label="Scan me!"]',
     'div[data-ref] canvas',               # older builds
-    'img[alt="Scan me!"]',                # sometimes img with data: src
-    'div[data-testid="qrcode"] img',      # fallback
+    'img[alt="Scan me!"]',
+    'div[data-testid="qrcode"] img',
 ]
 
 LOGIN_MARKERS = [
-    'div[data-testid="chat-list-search"]',  # logged-in shell
+    'div[data-testid="chat-list-search"]',
     'div[aria-label="Chat list"]',
     'header[data-testid="chatlist-header"]',
 ]
-
-WHATSAPP_WEB_URL = "https://web.whatsapp.com/"
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# ----------------------------------------------------------------------------
+DEFAULT_DUMP_DIR = "/tmp/whatsapp_diag"
 
-
+# --------------- Small helpers ---------------
 async def _safe_write_text(path: Union[str, Path], text: str) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
 
-
 async def _append_line(path: Union[str, Path], line: str) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
         f.write(line.rstrip("\n") + "\n")
 
+# --------------- Cache helpers (status) ---------------
+def _cache_key(session_id: str) -> str:
+    return f"wa_qr_status::{session_id}"
+
+def _cache_set(session_id: str, payload: dict, ttl: int = 300) -> None:
+    """Store status for polling (default TTL 5 minutes)."""
+    if not frappe:
+        return
+    try:
+        frappe.cache().set_value(_cache_key(session_id), payload, expires_in_sec=ttl)
+    except Exception:
+        pass
+
+def _cache_get(session_id: str) -> Optional[dict]:
+    if not frappe:
+        return None
+    try:
+        return frappe.cache().get_value(_cache_key(session_id))
+    except Exception:
+        return None
+
+def _cache_clear(session_id: str) -> None:
+    if not frappe:
+        return
+    try:
+        frappe.cache().delete_value(_cache_key(session_id))
+    except Exception:
+        pass
+
+# --------------- Playwright core ---------------
+async def _is_logged_in(page) -> bool:
+    for marker in LOGIN_MARKERS:
+        with contextlib.suppress(Exception):
+            if await page.locator(marker).first.is_visible():
+                return True
+    return False
 
 async def _logout_if_needed(page) -> None:
-    """
-    Attempt to force QR screen by clearing storages.
-    """
-    # Clear storages inside the page context
+    """Clear storages to force QR screen."""
     await page.context.clear_cookies()
-    # Clear all storages (local/session/indexedDB)
     await page.evaluate(
         """
         () => {
@@ -94,29 +122,12 @@ async def _logout_if_needed(page) -> None:
         }
         """
     )
-    # Navigate fresh
     await page.goto(WHATSAPP_WEB_URL, wait_until="networkidle")
 
-
-async def _is_logged_in(page) -> bool:
-    for marker in LOGIN_MARKERS:
-        try:
-            if await page.locator(marker).first.is_visible():
-                return True
-        except Exception:
-            pass
-    return False
-
-
 async def _try_extract_qr_dataurl(page, selector: str) -> Optional[str]:
-    """
-    If selector points to a visible QR (canvas or data: img), return data URL string.
-    """
     elt = page.locator(selector).first
     if not await elt.is_visible():
         return None
-
-    # Evaluate in-page to extract from canvas or data:img
     try:
         b64 = await page.evaluate(
             """
@@ -141,290 +152,78 @@ async def _try_extract_qr_dataurl(page, selector: str) -> Optional[str]:
         return None
     return None
 
-
 async def wait_for_qr(
     page,
     *,
     timeout_ms: int = 90_000,
     poll_ms: int = 1_250,
-    dump_dir: Union[str, Path] = "/tmp/whatsapp_diag",
+    dump_dir: Union[str, Path] = DEFAULT_DUMP_DIR,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Try to detect and extract QR as data URL within timeout.
-    If fails, take diagnostics (screenshot + html) and return (None, diag_path).
-    """
+    """Find QR as data URL. On failure, save diagnostics and return (None, png_path)."""
     start = time.time()
     while (time.time() - start) * 1000 < timeout_ms:
-        # If we are logged in already, clear session to force QR
         with contextlib.suppress(Exception):
             if await _is_logged_in(page):
                 await _logout_if_needed(page)
 
-        # Try multiple selectors
         for sel in QR_SELECTORS:
             data_url = await _try_extract_qr_dataurl(page, sel)
             if data_url:
                 return data_url, None
 
-        # Sometimes QR is behind a loader; small wait
         await asyncio.sleep(poll_ms / 1000.0)
 
-    # Diagnostics on failure
-    diag_dir = Path(dump_dir)
-    diag_dir.mkdir(parents=True, exist_ok=True)
+    # diagnostics
+    diag_dir = Path(dump_dir); diag_dir.mkdir(parents=True, exist_ok=True)
     png_path = str(diag_dir / "whatsapp_qr_not_found.png")
     html_path = str(diag_dir / "whatsapp_qr_not_found.html")
-
-    with contextlib.suppress(Exception):
-        await page.screenshot(path=png_path, full_page=True)
+    with contextlib.suppress(Exception): await page.screenshot(path=png_path, full_page=True)
     with contextlib.suppress(Exception):
         html = await page.content()
-        # Avoid giant files; keep useful chunk
         await _safe_write_text(html_path, html[:200_000])
-
     return None, png_path
-
 
 async def generate_qr_base64(
     *,
     headless: bool = True,
     user_agent: Optional[str] = None,
-    dump_dir: Union[str, Path] = "/tmp/whatsapp_diag",
+    dump_dir: Union[str, Path] = DEFAULT_DUMP_DIR,
     nav_timeout_ms: int = 120_000,
     qr_timeout_ms: int = 90_000,
     proxy: Optional[dict] = None,
     extra_browser_args: Optional[list] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Launch Chromium, navigate to WhatsApp Web, and extract QR as a data URL.
+    """Return (data:image/png;base64,..., None) on success; (None, diag_png_path) on failure."""
+    from playwright.async_api import async_playwright  # lazy import
 
-    Returns:
-        (data_url, diag_path)
-        - data_url: str like "data:image/png;base64,..." on success
-        - diag_path: path to PNG screenshot with "qr_not_found" on failure (None on success)
-
-    Params:
-        headless: run headless browser
-        user_agent: override UA string
-        dump_dir: directory for diagnostics (console logs, html, screenshots)
-        nav_timeout_ms: navigation timeout to WhatsApp Web
-        qr_timeout_ms: time budget to find QR
-        proxy: Playwright proxy dict, e.g. {"server": "http://host:port", "username": "...", "password": "..."}
-        extra_browser_args: list of extra Chromium args
-    """
-    from playwright.async_api import async_playwright  # local import to avoid hard dep on import time
-
-    dump_dir = Path(dump_dir)
-    dump_dir.mkdir(parents=True, exist_ok=True)
+    dump_dir = Path(dump_dir); dump_dir.mkdir(parents=True, exist_ok=True)
     console_log_path = dump_dir / "console.log"
 
-    # Prepare launch args (helpful for containers)
-    chromium_args = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-    ]
+    chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
     if extra_browser_args:
         chromium_args.extend(extra_browser_args)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=chromium_args,
-            proxy=proxy,
-        )
-
-        ctx_kwargs = dict(
+        browser = await p.chromium.launch(headless=headless, args=chromium_args, proxy=proxy)
+        context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=user_agent or DEFAULT_USER_AGENT,
             java_script_enabled=True,
-            # storage_state not provided: we want clean session
         )
-        if proxy:
-            # When using proxy, ensure consistent UA
-            ctx_kwargs["user_agent"] = user_agent or DEFAULT_USER_AGENT
-
-        context = await browser.new_context(**ctx_kwargs)
         page = await context.new_page()
 
-        # Capture console for diagnostics
-        page.on(
-            "console",
-            lambda msg: asyncio.create_task(_append_line(console_log_path, msg.text())),
-        )
+        page.on("console", lambda msg: asyncio.create_task(_append_line(console_log_path, msg.text())))
 
         try:
             await page.goto(WHATSAPP_WEB_URL, wait_until="networkidle", timeout=nav_timeout_ms)
-            data_url, diag = await wait_for_qr(
-                page,
-                timeout_ms=qr_timeout_ms,
-                dump_dir=dump_dir,
-            )
+            data_url, diag = await wait_for_qr(page, timeout_ms=qr_timeout_ms, dump_dir=dump_dir)
             return data_url, diag
         finally:
-            with contextlib.suppress(Exception):
-                await context.close()
-            with contextlib.suppress(Exception):
-                await browser.close()
+            with contextlib.suppress(Exception): await context.close()
+            with contextlib.suppress(Exception): await browser.close()
 
-
-# -------------------- Frappe Integration Helpers -----------------------------
-
-def _log_error(title: str, detail: str) -> None:
-    if frappe is None:
-        # fallback to stderr
-        sys.stderr.write(f"[ERROR] {title}\n{detail}\n")
-        return
-    # Frappe truncates title to 140 chars; keep it short and useful
-    safe_title = (title or "Error")[:140]
-    try:
-        frappe.log_error(safe_title, detail)
-    except Exception:
-        # As a last resort
-        sys.stderr.write(f"[FRAPPE LOG ERROR FAILED] {safe_title}\n{detail}\n")
-
-
-def _publish_qr_event(
-    device_name: str,
-    status: str,
-    *,
-    b64: Optional[str] = None,
-    diag: Optional[str] = None,
-    user: Optional[str] = None,
-    event_name: str = "whatsapp_qr",
-) -> None:
-    """
-    Publish realtime event to Desk.
-    """
-    if frappe is None:
-        return
-    try:
-        frappe.publish_realtime(
-            event=event_name,
-            message={"device": device_name, "status": status, "b64": b64, "diag": diag},
-            user=user or frappe.session.user,
-        )
-    except Exception as e:
-        _log_error("Realtime publish failed", str(e))
-
-
-def _ensure_playwright_installed_hint() -> str:
-    return (
-        "Make sure Playwright and browsers are installed:\n"
-        "  pip install playwright\n"
-        "  playwright install chromium\n"
-        "Also ensure OS deps for headless Chromium are present.\n"
-    )
-
-
-# Whitelisted method for Frappe (sync wrapper around async)
+# --------------- Frappe integration ---------------
 def _run_async(coro):
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        # If running within an existing event loop (rare in Frappe), create a new one in a thread
-        return asyncio.run(coro)  # safest fallback in our context
-    return asyncio.run(coro)
-
-
-if frappe:
-    try:
-        from frappe.model.document import Document  # noqa
-    except Exception:
-        pass
-
-    @frappe.whitelist()
-    def get_qr_data_url(
-        device_name: str = "default",
-        headless: int = 1,
-        dump_dir: str = "/tmp/whatsapp_diag",
-    ) -> Optional[str]:
-        """
-        Frappe callable: generates QR and publishes it via realtime.
-        Returns data URL on success; None on failure (check diag/logs).
-        """
-        try:
-            data_url, diag = _run_async(
-                generate_qr_base64(
-                    headless=bool(int(headless)),
-                    dump_dir=dump_dir,
-                )
-            )
-        except Exception as e:
-            _log_error(
-                "PW generate error",
-                f"{e}\n\n{_ensure_playwright_installed_hint()}",
-            )
-            _publish_qr_event(device_name, "error", diag=None)
-            return None
-
-        if not data_url:
-            _log_error(
-                "QR Generation Error: QR element not found (PW)",
-                f"debug:{diag}",
-            )
-            _publish_qr_event(device_name, "error", diag=diag)
-            return None
-
-        # Publish to UI (preferred: send base64 directly)
-        _publish_qr_event(device_name, "ok", b64=data_url)
-        return data_url
-
-
-# ------------------------------- CLI -----------------------------------------
-
-def _print(msg: str) -> None:
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
-
-
-def main_cli(argv: list[str]) -> int:
-    """
-    Minimal CLI for smoke testing:
-        python -m whatsapp_integration.whatsapp_playwright [--headful] [--dump /tmp/diag]
-    """
-    headless = True
-    dump_dir = "/tmp/whatsapp_diag"
-    i = 0
-    while i < len(argv):
-        if argv[i] in ("--headful", "--no-headless"):
-            headless = False
-        elif argv[i] in ("--dump", "--dump-dir") and i + 1 < len(argv):
-            dump_dir = argv[i + 1]
-            i += 1
-        i += 1
-
-    _print(f"Launching Playwright (headless={headless}) …")
-    try:
-        data_url, diag = asyncio.run(generate_qr_base64(headless=headless, dump_dir=dump_dir))
-    except Exception as e:
-        _print("ERROR: " + str(e))
-        _print(_ensure_playwright_installed_hint())
-        return 2
-
-    if data_url:
-        _print("QR extracted successfully (data URL).")
-        # For terminal brevity, don't print the whole data URL
-        _print("Preview (first 100 chars): " + data_url[:100] + " …")
-        return 0
-    else:
-        _print("Failed to find QR. Diagnostics saved at: " + str(diag))
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main_cli(sys.argv[1:]))
-
-
-
-try:
-    from whatsapp_integration.api.whatsapp_playwright import generate_qr_base64  # اگر همین فایل است، مشکلی نیست
-except Exception:
-    pass  # در همین فایل تعریف شده
-
-def _run_async_compat(coro):
-    import asyncio
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
@@ -433,96 +232,153 @@ def _run_async_compat(coro):
         return asyncio.run(coro)
     return asyncio.run(coro)
 
-@frappe.whitelist()
-def generate_whatsapp_qr_pw(
-    session_id: str,
-    timeout: int = 60,                 # ثانیه
-    headless: int = 1,
-    dump_dir: str = "/tmp/whatsapp_diag",
-):
-    """
-    سازگار با نسخه‌های قبلی:
-    خروجی:
-        {"status":"qr_generated","qr":"data:image/png;base64,...","session":session_id}
-        یا {"status":"already_connected", ...}
-        یا {"status":"error","message": "...", "diag": "/path/to/png"}
-    """
-    # نگاشت timeout -> میلی‌ثانیه برای هسته
-    qr_timeout_ms = 90_000
+def _log_error(title: str, detail: str) -> None:
+    title = (title or "Error")[:140]
+    if not frappe:
+        sys.stderr.write(f"[ERROR] {title}\n{detail}\n")
+        return
     try:
-        if isinstance(timeout, (int, float)) and timeout > 0:
-            qr_timeout_ms = int(float(timeout) * 1000)
+        frappe.log_error(title, detail)
     except Exception:
-        pass
+        sys.stderr.write(f"[FRAPPE LOG ERROR FAILED] {title}\n{detail}\n")
 
-    # تلاش برای تولید QR
-    try:
-        data_url, diag = _run_async_compat(
-            generate_qr_base64(
-                headless=bool(int(headless)),
-                dump_dir=dump_dir,
-                qr_timeout_ms=qr_timeout_ms,
-            )
-        )
-    except Exception as e:
-        # خطای Playwright / نصب
-        err = f"{e}"
-        try:
-            frappe.log_error("PW generate error", err[:2000])
-        except Exception:
-            pass
-        try:
-            frappe.publish_realtime(
-                event="whatsapp_qr",
-                message={"device": session_id, "status": "error", "diag": None},
-                user=frappe.session.user,
-            )
-        except Exception:
-            pass
-        return {"status": "error", "message": err, "diag": None, "session": session_id}
-
-    # اگر لاگین بود/QR نبود
-    if not data_url:
-        try:
-            frappe.log_error("QR Generation Error", f"debug:{diag}")
-        except Exception:
-            pass
-        try:
-            frappe.publish_realtime(
-                event="whatsapp_qr",
-                message={"device": session_id, "status": "error", "diag": diag},
-                user=frappe.session.user,
-            )
-        except Exception:
-            pass
-        return {
-            "status": "error",
-            "message": "QR not found (Playwright)",
-            "diag": diag,
-            "session": session_id,
-        }
-
-    # موفقیت: انتشار به UI و برگرداندن دیکشنری مورد انتظار
+def _publish_qr_event(session_id: str, status: str, *, b64: Optional[str] = None, diag: Optional[str] = None) -> None:
+    if not frappe:
+        return
     try:
         frappe.publish_realtime(
             event="whatsapp_qr",
-            message={"device": session_id, "status": "qr_generated", "qr": data_url},
+            message={"device": session_id, "status": status, "qr": b64, "diag": diag},
             user=frappe.session.user,
         )
-    except Exception:
-        # اگر publish نشد، فقط برگردان
-        pass
+    except Exception as e:
+        _log_error("Realtime publish failed", str(e))
 
-    return {
-        "status": "qr_generated",       # با کدهای پایین‌دستی سازگار است
-        "qr": data_url,                 # کدها دنبال "qr" یا "qr_data" می‌گردند
-        "session": session_id,
-        "message": "QR code ready for scanning",
-    }
-# Public exports
+# Whitelisted simple API (returns string)
+if frappe:
+    @frappe.whitelist()
+    def get_qr_data_url(device_name: str = "default", headless: int = 1, dump_dir: str = DEFAULT_DUMP_DIR) -> Optional[str]:
+        """Generate QR and publish. Returns data-url string or None."""
+        try:
+            data_url, diag = _run_async(generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir))
+        except Exception as e:
+            _log_error("PW generate error", f"{e}")
+            _publish_qr_event(device_name, "error", diag=None)
+            _cache_set(device_name, {"status": "error", "diag": None, "session": device_name})
+            return None
+
+        if not data_url:
+            _log_error("QR Generation Error", f"debug:{diag}")
+            _publish_qr_event(device_name, "error", diag=diag)
+            _cache_set(device_name, {"status": "error", "diag": diag, "session": device_name})
+            return None
+
+        _publish_qr_event(device_name, "qr_generated", b64=data_url)
+        _cache_set(device_name, {"status": "qr_generated", "qr": data_url, "session": device_name})
+        return data_url
+
+# --------------- Backward-compatible APIs ---------------
+if frappe:
+    @frappe.whitelist()
+    def generate_whatsapp_qr_pw(
+        session_id: str,
+        timeout: int = 60,
+        headless: int = 1,
+        dump_dir: str = DEFAULT_DUMP_DIR,
+    ) -> dict:
+        """
+        Legacy-compatible generator.
+        Returns:
+            {"status":"qr_generated","qr":"data:image/png;base64,...","session":session_id}
+            or {"status":"error","message":"...","diag":"...","session":session_id}
+        Also publishes realtime 'whatsapp_qr' event and sets cache for polling.
+        """
+        qr_timeout_ms = 90_000
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            qr_timeout_ms = int(float(timeout) * 1000)
+
+        try:
+            data_url, diag = _run_async(
+                generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir, qr_timeout_ms=qr_timeout_ms)
+            )
+        except Exception as e:
+            msg = f"{e}"
+            _log_error("PW generate error", msg[:2000])
+            _publish_qr_event(session_id, "error", diag=None)
+            res = {"status": "error", "message": msg, "diag": None, "session": session_id}
+            _cache_set(session_id, res)
+            return res
+
+        if not data_url:
+            _log_error("QR Generation Error", f"debug:{diag}")
+            _publish_qr_event(session_id, "error", diag=diag)
+            res = {"status": "error", "message": "QR not found (Playwright)", "diag": diag, "session": session_id}
+            _cache_set(session_id, res)
+            return res
+
+        _publish_qr_event(session_id, "qr_generated", b64=data_url)
+        res = {"status": "qr_generated", "qr": data_url, "session": session_id, "message": "QR code ready"}
+        _cache_set(session_id, res)
+        return res
+
+    @frappe.whitelist()
+    def check_qr_status_pw(session_id: str) -> dict:
+        """
+        Legacy-compatible status probe for polling UIs.
+        Reads status from cache set by generate_whatsapp_qr_pw / get_qr_data_url.
+        Returns one of:
+            {"status":"qr_generated","qr":"...","session":...}
+            {"status":"error","message":"...","diag":"...","session":...}
+            {"status":"waiting","session":...}
+        """
+        res = _cache_get(session_id)
+        if not res:
+            # nothing yet in cache → still waiting
+            return {"status": "waiting", "session": session_id}
+        # normalize keys for older clients that use "qr_data"
+        if res.get("qr") and "qr_data" not in res:
+            res["qr_data"] = res["qr"]
+        return res
+
+    @frappe.whitelist()
+    def clear_qr_status_pw(session_id: str) -> None:
+        """Optional: clear cache after success or when starting over."""
+        _cache_clear(session_id)
+
+# --------------- Optional CLI smoke test ---------------
+def _print(msg: str) -> None:
+    sys.stdout.write(msg + "\n"); sys.stdout.flush()
+
+def main_cli(argv: list[str]) -> int:
+    headless = True; dump_dir = DEFAULT_DUMP_DIR
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--headful", "--no-headless"): headless = False
+        elif argv[i] in ("--dump", "--dump-dir") and i + 1 < len(argv): dump_dir = argv[i + 1]; i += 1
+        i += 1
+
+    _print(f"Launching Playwright (headless={headless}) …")
+    try:
+        data_url, diag = asyncio.run(generate_qr_base64(headless=headless, dump_dir=dump_dir))
+    except Exception as e:
+        _print("ERROR: " + str(e))
+        return 2
+    if data_url:
+        _print("QR extracted successfully (data URL).")
+        _print("Preview (first 100): " + data_url[:100] + " …")
+        return 0
+    else:
+        _print("Failed to find QR. Diagnostics: " + str(diag))
+        return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main_cli(sys.argv[1:]))
+
 __all__ = [
     "generate_qr_base64",
     "wait_for_qr",
     "get_qr_data_url",
     "generate_whatsapp_qr_pw",
+    "check_qr_status_pw",
+    "clear_qr_status_pw",
 ]
