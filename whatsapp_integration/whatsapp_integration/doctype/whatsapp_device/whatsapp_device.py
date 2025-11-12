@@ -1,5 +1,26 @@
+import os
+import requests
 import frappe
 from frappe.model.document import Document
+
+
+def _get_node_base_url():
+    """Resolve Node.js WhatsApp service base URL.
+    Priority: env `WHATSAPP_NODE_URL` > Settings.nodejs_url > default.
+    """
+    env_url = os.getenv("WHATSAPP_NODE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    try:
+        settings = frappe.get_doc("WhatsApp Settings")
+        node_url = (settings.nodejs_url or "").strip()
+        if node_url:
+            return node_url.rstrip("/")
+    except Exception:
+        pass
+
+    return "http://localhost:3001"
 
 class WhatsAppDevice(Document):
     @frappe.whitelist()
@@ -85,75 +106,47 @@ class WhatsAppDevice(Document):
     
     @frappe.whitelist()
     def generate_qr_code(self):
-        """Generate QR code for WhatsApp Web authentication using Python service"""
+        """Generate QR code using Node.js WhatsApp service (Unofficial)."""
         settings = frappe.get_doc("WhatsApp Settings")
-        
+
         if settings.mode != "Unofficial":
             frappe.msgprint("QR Code generation only works in Unofficial mode")
             return
-        
+
+        base_url = _get_node_base_url()
+        session_id = self.number
+
         try:
-            # Try Quick Real WhatsApp QR generation first
+            resp = requests.get(f"{base_url}/qr/{session_id}", timeout=20)
+            if resp.status_code != 200:
+                raise Exception(f"Node service error: HTTP {resp.status_code}")
+            data = resp.json()
+            qr = data.get("qr")
+            if not qr:
+                raise Exception("QR not returned by Node service")
+
+            self.qr_code = qr
+            self.status = "QR Generated"
+            self.save()
+            frappe.msgprint(f"QR generated via Node for {self.number}. Scan with WhatsApp.")
+            return {"status": "qr_generated", "qr": qr, "session": session_id}
+
+        except Exception as e:
+            frappe.log_error(f"Node QR Generation Failed: {str(e)}", "WhatsApp Device")
+            # Fallback to previous simple QR to avoid blocking user
             try:
-                from whatsapp_integration.api.whatsapp_quick_qr import generate_quick_qr
-                frappe.msgprint("Generating real WhatsApp QR code (quick method)...")
-                
-                result = generate_quick_qr(self.number)
-                
+                from whatsapp_integration.api.whatsapp_simple import generate_simple_qr_code
+                result = generate_simple_qr_code(self.number)
                 if result.get("status") == "qr_generated":
                     self.qr_code = result.get("qr")
                     self.status = "QR Generated"
-                    self.save()  # Save the document to persist QR data
-                    frappe.msgprint(f"Real WhatsApp QR generated for {self.number}. Scan with your phone!")
+                    self.save()
+                    frappe.msgprint("Fallback simple QR generated. Open https://web.whatsapp.com to scan.")
                     return result
-                else:
-                    # If quick QR fails, try the full real QR service
-                    raise Exception(f"Quick QR failed: {result.get('message', 'Unknown error')}")
-                    
-            except Exception as quick_qr_error:
-                frappe.log_error(f"Quick QR Generation Failed: {str(quick_qr_error)}", "WhatsApp Device")
-                frappe.msgprint(f"Quick QR failed: {str(quick_qr_error)}. Trying advanced method...")
-                
-                # Try the full real QR service
-                try:
-                    from whatsapp_integration.api.whatsapp_real_qr import generate_whatsapp_qr
-                    result = generate_whatsapp_qr(self.number, timeout=20)
-                    
-                    if result.get("status") == "qr_generated":
-                        self.qr_code = result.get("qr")
-                        self.status = "QR Generated"
-                        self.save()  # Save the document to persist QR data
-                        frappe.msgprint(f"Real WhatsApp QR generated for {self.number}. Scan with your phone!")
-                        return result
-                    elif result.get("status") == "already_connected":
-                        self.status = "Connected"
-                        self.save()  # Save the status update
-                        frappe.msgprint(f"Device {self.number} is already connected!")
-                        return result
-                    else:
-                        raise Exception("Advanced real QR generation failed")
-                        
-                except Exception as real_qr_error:
-                    frappe.log_error(f"Real QR Generation Failed: {str(real_qr_error)}", "WhatsApp Device")
-                    frappe.msgprint(f"Real QR failed: {str(real_qr_error)}. Using simple fallback...")
-                    
-                    # Final fallback to simple QR generation
-                    from whatsapp_integration.api.whatsapp_simple import generate_simple_qr_code
-                    result = generate_simple_qr_code(self.number)
-                    
-                    if result.get("status") == "qr_generated":
-                        self.qr_code = result.get("qr")
-                        self.status = "QR Generated"
-                        self.save()  # Save the document to persist QR data
-                        frappe.msgprint("Simple QR generated. Visit https://web.whatsapp.com manually to scan.")
-                        return result
-                    else:
-                        error_msg = result.get("message", "Failed to generate simple QR code")
-                        frappe.throw(f"QR generation failed: {error_msg}")
-                
-        except Exception as e:
-            frappe.log_error(f"QR Generation Error: {str(e)}", "WhatsApp QR Generation")
-            frappe.throw(f"Error generating QR code: {str(e)}")
+            except Exception:
+                pass
+
+            frappe.throw(f"Error generating QR via Node: {str(e)}")
 
     def test_connection(self):
         """Test WhatsApp connection status"""
@@ -186,26 +179,25 @@ class WhatsAppDevice(Document):
 
 @frappe.whitelist()
 def refresh_qr_code(device_name):
-    """Manual QR code refresh for existing devices using Python service"""
+    """Manual QR code refresh for existing devices using Node service (Unofficial)."""
     try:
         device = frappe.get_doc("WhatsApp Device", device_name)
+        base_url = _get_node_base_url()
+        session_id = device.number
+
+        resp = requests.get(f"{base_url}/qr/{session_id}", timeout=20)
+        if resp.status_code != 200:
+            frappe.throw(f"Node service error: HTTP {resp.status_code}")
+        data = resp.json()
+        qr = data.get("qr")
+        if not qr:
+            frappe.throw("QR not returned by Node service")
+
+        device.qr_code = qr
+        device.status = "Disconnected"
+        device.save()
+        return {"message": "QR Code refreshed successfully via Node"}
         
-        from whatsapp_integration.api.whatsapp_python import generate_qr_code
-        result = generate_qr_code(device.number)
-        
-        if result.get("status") == "qr_generated":
-            device.qr_code = result.get("qr")
-            device.status = "Disconnected"
-            device.save()
-            return {"message": "QR Code refreshed successfully"}
-        elif result.get("status") == "already_connected":
-            device.status = "Connected"
-            device.save()
-            return {"message": "Device is already connected"}
-        else:
-            error_msg = result.get("message", "Failed to refresh QR code")
-            frappe.throw(f"QR refresh failed: {error_msg}")
-            
     except Exception as e:
         frappe.log_error(f"QR Refresh Error: {str(e)}", "WhatsApp QR Refresh")
         return {"error": str(e)}
