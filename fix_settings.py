@@ -5,7 +5,7 @@ def update_whatsapp_settings():
     try:
         settings = frappe.get_doc("WhatsApp Settings")
         settings.mode = "Unofficial"
-        settings.nodejs_url = "http://localhost:3001"
+        settings.nodejs_url = "http://localhost:8001"
         settings.save(ignore_permissions=True)
         print("✅ WhatsApp Settings updated successfully!")
         print(f"Mode: {settings.mode}")

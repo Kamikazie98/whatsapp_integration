@@ -13,7 +13,7 @@ def _get_node_base_url():
             return node_url.rstrip("/")
     except Exception:
         pass
-    return "http://localhost:3001"
+    return "http://localhost:8001"
 
 def send_unofficial(number, message):
     """Send message via Node.js WhatsApp service using a connected device session.
