@@ -238,11 +238,11 @@ def _maybe_dismiss_and_reload_qr(page) -> None:
 
 @frappe.whitelist()
 def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
-    """Generate QR with Playwright (headless, persistent profile)."""
-    user_data_dir = _resolve_user_data_dir(session_id)
-    _prepare_playwright_env()
-    try:
-        with sync_playwright() as p:
+	"""Generate QR with Playwright (headless, persistent profile)."""
+	user_data_dir = _resolve_user_data_dir(session_id)
+	_prepare_playwright_env()
+	try:
+		with sync_playwright() as p:
 			# Allow headful debug via env: WHATSAPP_PW_HEADLESS=0 or 'false'
 			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
 			headless = not (h_env in {"0", "false", "no"})
@@ -329,9 +329,9 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 def check_qr_status_pw(session_id: str):
 	"""Check connection or refresh QR with Playwright using persisted profile."""
 	user_data_dir = _resolve_user_data_dir(session_id)
-    _prepare_playwright_env()
-    try:
-        with sync_playwright() as p:
+	_prepare_playwright_env()
+	try:
+		with sync_playwright() as p:
 			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
 			headless = not (h_env in {"0", "false", "no"})
 			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
@@ -378,14 +378,14 @@ def send_message_pw(session_id: str, phone_number: str, message: str):
 	"""Send message via Playwright (requires linked device in this profile)."""
 	user_data_dir = _resolve_user_data_dir(session_id)
 	_prepare_playwright_env()
-    try:
+	try:
 		dest = "".join(filter(str.isdigit, phone_number or ""))
 		if not dest:
 			return {"success": False, "error": "Invalid destination number"}
 		text = urllib.parse.quote(message or "")
 		chat_url = f"https://web.whatsapp.com/send?phone={dest}&text={text}"
 
-        with sync_playwright() as p:
+		with sync_playwright() as p:
 			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
 			headless = not (h_env in {"0", "false", "no"})
 			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
