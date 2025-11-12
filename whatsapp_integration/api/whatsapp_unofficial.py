@@ -45,7 +45,7 @@ def send_unofficial(number, message):
 			if isinstance(result, dict) and result.get("success"):
 				return result
 		except Exception as pw_err:
-			frappe.log_error(f"PW send failed: {pw_err}", "WhatsApp Unofficial Send")
+			frappe.log_error("WhatsApp Unofficial Send", f"PW send failed: {pw_err}")
 
 		# 2) Simple fallback
 		from whatsapp_integration.api.whatsapp_python import send_message
@@ -55,8 +55,9 @@ def send_unofficial(number, message):
 		raise Exception(result.get("error", "Failed to send message"))
 
 	except Exception as e:
-		frappe.log_error(f"Unofficial send error: {str(e)}", "WhatsApp Unofficial Send")
-		raise Exception(f"Failed to send message: {str(e)}")
+		message = f"Failed to send message: {str(e)}"
+		frappe.log_error("WhatsApp Unofficial Send", message)
+		frappe.throw(message)
 
 @frappe.whitelist()
 def check_device_status(session_id):
@@ -69,5 +70,5 @@ def check_device_status(session_id):
 		return {"status": status or "Unknown"}
 		
 	except Exception as e:
-		frappe.log_error(f"Status check error: {str(e)}", "WhatsApp Status Check")
+		frappe.log_error("WhatsApp Status Check", f"Status check error: {str(e)}")
 		return {"status": "Error", "message": str(e)}
