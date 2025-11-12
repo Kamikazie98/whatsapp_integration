@@ -6,7 +6,7 @@ if (!globalThis.crypto || !('hkdfSync' in globalThis.crypto)) {
 }
 import express from 'express';
 import bodyParser from 'body-parser';
-import { startSession, sendMessage, getQR, getSessionStatus, listSessions, resetSession } from './whatsapp.js';
+import { startSession, sendMessage, getQR, getSessionStatus, listSessions, resetSession } from './engine.js';
 import config from './config.js';
 
 const app = express();
