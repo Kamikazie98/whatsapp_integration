@@ -312,6 +312,7 @@ def _ensure_pw_monitor(
     headless: bool,
     dump_dir: Union[str, Path],
     qr_timeout_ms: int,
+    announce: bool = True,
 ) -> None:
     """Start a background Playwright session that keeps QR data fresh."""
     with _pw_lock:
@@ -328,7 +329,8 @@ def _ensure_pw_monitor(
             name=f"wa-pw-monitor-{session_id}",
         )
         _active_pw_threads[session_id] = thread
-        _store_status(session_id, "starting", message="Launching Playwright session")
+        if announce:
+            _store_status(session_id, "starting", message="Launching Playwright session")
         thread.start()
 
 
@@ -498,24 +500,40 @@ if frappe:
     def get_qr_data_url(device_name: str = "default", headless: int = 1, dump_dir: str = DEFAULT_DUMP_DIR) -> Optional[str]:
         """Generate QR and publish. Returns data-url string or None."""
         qr_timeout_ms = 90_000
+        try:
+            data_url, diag = _run_async(generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir))
+        except Exception as e:
+            msg = f"{e}"
+            _log_error("PW generate error", msg[:2000])
+            _store_status(device_name, "error", message=msg, diag=None, publish=True)
+            return None
+
+        if not data_url:
+            _log_error("QR Generation Error", f"debug:{diag}")
+            _store_status(
+                device_name,
+                "error",
+                message="QR not found (Playwright)",
+                diag=diag,
+                publish=True,
+            )
+            return None
+
+        _store_status(
+            device_name,
+            "qr_generated",
+            qr=data_url,
+            message="QR code ready",
+            publish=True,
+        )
         _ensure_pw_monitor(
             device_name,
             headless=bool(int(headless)),
             dump_dir=dump_dir,
             qr_timeout_ms=qr_timeout_ms,
+            announce=False,
         )
-        deadline = time.time() + max(qr_timeout_ms / 1000, 60)
-        while time.time() < deadline:
-            res = _cache_get(device_name)
-            if res:
-                status = res.get("status")
-                if status == "qr_generated" and res.get("qr"):
-                    return res["qr"]
-                if status == "error":
-                    return None
-            time.sleep(QR_WAIT_POLL_INTERVAL)
-        res = _cache_get(device_name) or {}
-        return res.get("qr")
+        return data_url
 
 # --------------- Backward-compatible APIs ---------------
 if frappe:
@@ -537,36 +555,48 @@ if frappe:
         if isinstance(timeout, (int, float)) and timeout > 0:
             qr_timeout_ms = int(float(timeout) * 1000)
 
+        try:
+            data_url, diag = _run_async(
+                generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir, qr_timeout_ms=qr_timeout_ms)
+            )
+        except Exception as e:
+            msg = f"{e}"
+            _log_error("PW generate error", msg[:2000])
+            res = _store_status(
+                session_id,
+                "error",
+                message=msg,
+                diag=None,
+                publish=True,
+            )
+            return res
+
+        if not data_url:
+            _log_error("QR Generation Error", f"debug:{diag}")
+            res = _store_status(
+                session_id,
+                "error",
+                message="QR not found (Playwright)",
+                diag=diag,
+                publish=True,
+            )
+            return res
+
+        res = _store_status(
+            session_id,
+            "qr_generated",
+            qr=data_url,
+            message="QR code ready",
+            publish=True,
+        )
+
         _ensure_pw_monitor(
             session_id,
             headless=bool(int(headless)),
             dump_dir=dump_dir,
             qr_timeout_ms=qr_timeout_ms,
+            announce=False,
         )
-
-        wait_seconds = max(float(timeout), 5.0)
-        deadline = time.time() + wait_seconds
-        last_res = None
-        while time.time() < deadline:
-            res = _cache_get(session_id)
-            if res:
-                last_res = dict(res)
-                status = res.get("status")
-                if status in {"qr_generated", "error", "connected"}:
-                    return res
-            time.sleep(QR_WAIT_POLL_INTERVAL)
-
-        if last_res:
-            payload = dict(last_res)
-            payload.setdefault("message", f"QR generation still in progress after {int(wait_seconds)} seconds")
-            return payload
-
-        res = {
-            "status": "waiting",
-            "session": session_id,
-            "message": f"QR generation still in progress after {int(wait_seconds)} seconds",
-        }
-        _cache_set(session_id, res)
         return res
 
     @frappe.whitelist()
