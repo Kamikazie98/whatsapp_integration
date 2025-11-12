@@ -60,7 +60,8 @@ DEFAULT_USER_AGENT = (
 
 DEFAULT_DUMP_DIR = "/tmp/whatsapp_diag"
 QR_MONITOR_SECS = 600  # keep refreshing QR for 10 minutes
-QR_REFRESH_INTERVAL = 3.0
+# WhatsApp rotates the QR roughly every 20 seconds, so we only need to poll that often
+QR_REFRESH_INTERVAL = 20.0
 QR_WAIT_POLL_INTERVAL = 0.5
 
 _active_pw_threads: dict[str, threading.Thread] = {}
