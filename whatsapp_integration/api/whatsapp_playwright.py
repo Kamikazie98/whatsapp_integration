@@ -82,22 +82,36 @@ def _cache_key(session_id: str) -> str:
 
 def _cache_set(session_id: str, payload: dict, ttl: int = 300) -> None:
     """Store status for polling (default TTL 5 minutes)."""
+    snap = dict(payload)
+    snap.setdefault("session", session_id)
+    with _pw_lock:
+        _active_pw_state[session_id] = snap
     if not frappe:
         return
     try:
-        frappe.cache().set_value(_cache_key(session_id), payload, expires_in_sec=ttl)
+        frappe.cache().set_value(_cache_key(session_id), snap, expires_in_sec=ttl)
     except Exception:
         pass
 
 def _cache_get(session_id: str) -> Optional[dict]:
+    with _pw_lock:
+        snap = _active_pw_state.get(session_id)
+        if snap:
+            return dict(snap)
     if not frappe:
-        return None
+        return snap
     try:
-        return frappe.cache().get_value(_cache_key(session_id))
+        res = frappe.cache().get_value(_cache_key(session_id))
+        if res:
+            with _pw_lock:
+                _active_pw_state[session_id] = dict(res)
+        return res
     except Exception:
-        return None
+        return snap
 
 def _cache_clear(session_id: str) -> None:
+    with _pw_lock:
+        _active_pw_state.pop(session_id, None)
     if not frappe:
         return
     try:
