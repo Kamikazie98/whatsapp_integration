@@ -423,24 +423,46 @@ def generate_whatsapp_qr_pw(
     device_name: str = "default",
     headless: int = 1,
     dump_dir: str = "/tmp/whatsapp_diag",
-    timeout: int | None = None,  # legacy param for backward compatibility
+    timeout: int | None = None,   # seconds; optional/legacy
 ):
     """
-    Legacy wrapper for backward compatibility.
-    Accepts 'timeout' (ignored) so that older calls don't break.
-    Publishes realtime via get_qr_data_url.
+    Legacy-compatible wrapper:
+    - Generates QR via Playwright
+    - Publishes realtime to UI
+    - Returns a dict: {"status": "ok", "b64": "..."} on success
+                      {"status": "error", "diag": "/path/to/png"} on failure
     """
-    if frappe:
-        # Reuse official path; ignore timeout param
-        return get_qr_data_url(device_name=device_name, headless=headless, dump_dir=dump_dir)
+    # translate timeout (sec) -> qr_timeout_ms
+    qr_timeout_ms = 90_000
+    if isinstance(timeout, (int, float)) and timeout > 0:
+        qr_timeout_ms = int(float(timeout) * 1000)
 
-    # Fallback for non-Frappe environments
-    import asyncio
-    data_url, _diag = asyncio.run(
-        generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir)
-    )
-    return data_url
+    try:
+        # مستقیماً هستهٔ async را صدا می‌زنیم تا diag هم داشته باشیم
+        data_url, diag = _run_async(
+            generate_qr_base64(
+                headless=bool(int(headless)),
+                dump_dir=dump_dir,
+                qr_timeout_ms=qr_timeout_ms,
+            )
+        )
+    except Exception as e:
+        _log_error(
+            "PW generate error",
+            f"{e}\n\n{_ensure_playwright_installed_hint()}",
+        )
+        _publish_qr_event(device_name, "error", diag=None)
+        return {"status": "error", "diag": None}
 
+    if not data_url:
+        # لاگ کوتاه تا از ۱۴۰ کاراکتر تجاوز نکند
+        _log_error("QR Generation Error", f"debug:{diag}")
+        _publish_qr_event(device_name, "error", diag=diag)
+        return {"status": "error", "diag": diag}
+
+    # موفق: به UI publish و دیکشنری سازگار برگردان
+    _publish_qr_event(device_name, "ok", b64=data_url)
+    return {"status": "ok", "b64": data_url}
 # Public exports
 __all__ = [
     "generate_qr_base64",
