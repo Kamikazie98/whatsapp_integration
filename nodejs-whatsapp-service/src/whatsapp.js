@@ -1,6 +1,6 @@
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
 import QRCode from "qrcode";
 import axios from "axios";
 import config from "./config.js";
@@ -14,7 +14,14 @@ export async function getQR(sessionId) {
     }
     
     await startSession(sessionId);
-    return qrCodes[sessionId] || "QR code not available";
+    // wait briefly for QR to be populated by the connection.update event
+    for (let i = 0; i < 24; i++) { // ~12s total
+        if (qrCodes[sessionId]) {
+            return qrCodes[sessionId];
+        }
+        await new Promise((r) => setTimeout(r, 500));
+    }
+    return "QR code not available";
 }
 
 export async function startSession(sessionId) {
@@ -31,11 +38,16 @@ export async function startSession(sessionId) {
             throw new Error('makeWASocket is not available');
         }
 
-        const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${sessionId}`);
+        const { state, saveCreds } = await useMultiFileAuthState(`${config.session_path}/${sessionId}`);
+        
+        const { version } = await fetchLatestBaileysVersion();
         
         const sock = makeWASocket({ 
+            version,
             auth: state,
-            printQRInTerminal: true
+            // capture QR in code, not terminal
+            printQRInTerminal: false,
+            browser: ["Chrome", "Linux", "120.0.0"],
         });
 
         sock.ev.on("connection.update", async (update) => {
