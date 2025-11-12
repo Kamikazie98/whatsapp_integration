@@ -463,17 +463,18 @@ async def _pw_monitor_async(
     profile_path.mkdir(parents=True, exist_ok=True)
     with _pw_lock:
         _active_pw_profiles[session_id] = profile_path
-    browser = context = page = None
+    context = page = None
     try:
         async with async_playwright() as p:
-            chromium_args.append(f"--user-data-dir={profile_path}")
-            browser = await p.chromium.launch(headless=headless, args=chromium_args)
-            context = await browser.new_context(
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_path),
+                headless=headless,
+                args=chromium_args,
                 viewport={"width": 1280, "height": 900},
                 user_agent=DEFAULT_USER_AGENT,
                 java_script_enabled=True,
             )
-            page = await context.new_page()
+            page = context.pages[0] if context.pages else await context.new_page()
             page.on("console", lambda msg: asyncio.create_task(_append_line(console_log_path, msg.text())))
 
             await page.goto(WHATSAPP_WEB_URL, wait_until="networkidle", timeout=120_000)
@@ -554,9 +555,6 @@ async def _pw_monitor_async(
         with contextlib.suppress(Exception):
             if context:
                 await context.close()
-        with contextlib.suppress(Exception):
-            if browser:
-                await browser.close()
         with _pw_lock:
             _active_pw_profiles.pop(session_id, None)
 
