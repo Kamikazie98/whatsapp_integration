@@ -7,35 +7,49 @@ import fs from "fs";
 import path from "path";
 import config from "./config.js";
 
+// Normalize and stabilize session storage path
+const sessionRoot = path.isAbsolute(config.session_path)
+  ? config.session_path
+  : path.join(process.cwd(), config.session_path);
+if (!fs.existsSync(sessionRoot)) {
+  fs.mkdirSync(sessionRoot, { recursive: true });
+}
+
+function normalizeSessionId(id) {
+  return String(id || "default").replace(/[^0-9A-Za-z_\-]/g, "");
+}
+
 let sessions = {};
 let qrCodes = {};
 
 export async function getQR(sessionId) {
-  if (qrCodes[sessionId]) {
-    return qrCodes[sessionId];
+  const sid = normalizeSessionId(sessionId);
+  if (qrCodes[sid]) {
+    return qrCodes[sid];
   }
-  await startSession(sessionId);
+  await startSession(sid);
   // Wait briefly for QR event
   for (let i = 0; i < 30; i++) {
-    if (qrCodes[sessionId]) return qrCodes[sessionId];
+    if (qrCodes[sid]) return qrCodes[sid];
     await new Promise((r) => setTimeout(r, 500));
   }
   return "QR code not available";
 }
 
 export async function startSession(sessionId) {
-  if (sessions[sessionId]) {
+  const sid = normalizeSessionId(sessionId);
+  if (sessions[sid]) {
     return "Session already active";
   }
   try {
-    console.log(`Starting session for ${sessionId}`);
+    console.log(`Starting session for ${sid}`);
 
     if (typeof makeWASocket !== "function") {
       console.error("makeWASocket is not a function. Baileys import failed.");
       throw new Error("makeWASocket is not available");
     }
 
-    const authPath = path.join(config.session_path, sessionId);
+    const authPath = path.join(sessionRoot, sid);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -50,7 +64,7 @@ export async function startSession(sessionId) {
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      console.log(`Connection update for ${sessionId}:`, {
+      console.log(`Connection update for ${sid}:`, {
         connection,
         qr: qr ? "QR received" : "No QR",
       });
@@ -58,10 +72,10 @@ export async function startSession(sessionId) {
       if (qr) {
         try {
           const qrString = await QRCode.toDataURL(qr);
-          qrCodes[sessionId] = qrString;
-          console.log(`QR Code generated for session: ${sessionId}`);
+          qrCodes[sid] = qrString;
+          console.log(`QR Code generated for session: ${sid}`);
         } catch (qrError) {
-          console.error(`QR generation failed for ${sessionId}:`, qrError);
+          console.error(`QR generation failed for ${sid}:`, qrError);
         }
       }
 
@@ -69,26 +83,27 @@ export async function startSession(sessionId) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const deviceRemoved = statusCode === 401; // stream:error conflict/device_removed
         const loggedOut = statusCode === DisconnectReason.loggedOut;
-        console.log(`Connection closed for ${sessionId} (status: ${statusCode})`);
+        console.log(`Connection closed for ${sid} (status: ${statusCode})`);
 
         try {
           if (deviceRemoved || loggedOut) {
             if (fs.existsSync(authPath)) {
               fs.rmSync(authPath, { recursive: true, force: true });
-              console.log(`Cleared session directory for ${sessionId}`);
+              console.log(`Cleared session directory for ${sid}`);
             }
-            delete sessions[sessionId];
-            delete qrCodes[sessionId];
+            delete sessions[sid];
+            delete qrCodes[sid];
           }
         } catch (e) {
           console.error("Failed clearing session directory:", e);
         }
         // Always drop the in-memory session handle so restart can proceed
-        delete sessions[sessionId];
-        setTimeout(() => startSession(sessionId), 800);
+        delete sessions[sid];
+        const delay = deviceRemoved || loggedOut ? 3000 : 800;
+        setTimeout(() => startSession(sid), delay);
       } else if (connection === "open") {
-        console.log(`WhatsApp session ${sessionId} connected`);
-        delete qrCodes[sessionId];
+        console.log(`WhatsApp session ${sid} connected`);
+        delete qrCodes[sid];
       }
     });
 
@@ -119,8 +134,8 @@ export async function startSession(sessionId) {
       }
     });
 
-    sessions[sessionId] = sock;
-    console.log(`Session ${sessionId} started successfully`);
+    sessions[sid] = sock;
+    console.log(`Session ${sid} started successfully`);
     return "Session started";
   } catch (error) {
     console.error(`Failed to start session ${sessionId}:`, error);
@@ -129,7 +144,8 @@ export async function startSession(sessionId) {
 }
 
 export async function sendMessage(sessionId, to, message) {
-  const sock = sessions[sessionId];
+  const sid = normalizeSessionId(sessionId);
+  const sock = sessions[sid];
   if (!sock) {
     throw new Error("Session not found. Please scan QR code first.");
   }
@@ -151,9 +167,10 @@ export async function sendMessage(sessionId, to, message) {
 }
 
 export function getSessionStatus(sessionId) {
-  if (sessions[sessionId]) {
+  const sid = normalizeSessionId(sessionId);
+  if (sessions[sid]) {
     return "Connected";
-  } else if (qrCodes[sessionId]) {
+  } else if (qrCodes[sid]) {
     return "Waiting for scan";
   } else {
     return "Disconnected";
@@ -167,12 +184,13 @@ export function listSessions() {
 
 export function resetSession(sessionId) {
   try {
-    const authPath = path.join(config.session_path, sessionId);
+    const sid = normalizeSessionId(sessionId);
+    const authPath = path.join(sessionRoot, sid);
     if (fs.existsSync(authPath)) {
       fs.rmSync(authPath, { recursive: true, force: true });
     }
-    delete sessions[sessionId];
-    delete qrCodes[sessionId];
+    delete sessions[sid];
+    delete qrCodes[sid];
     return { success: true };
   } catch (e) {
     return { success: false, error: String(e) };
