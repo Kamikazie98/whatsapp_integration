@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import shutil
 import sys
 import threading
 import time
@@ -155,6 +156,16 @@ def _store_status(
     if publish:
         _publish_qr_event(session_id, status, b64=qr, diag=diag)
     return payload
+
+
+def _make_profile_dir(session_id: str, dump_dir: Union[str, Path]) -> Path:
+    """Create a unique Chrome profile directory per monitor run."""
+    base = Path(dump_dir) / "pw_profiles"
+    base.mkdir(parents=True, exist_ok=True)
+    safe = session_id.replace("/", "_").replace("\\", "_")
+    profile = base / f"{safe}_{int(time.time() * 1000)}"
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
 
 # --------------- Playwright core ---------------
 async def _is_logged_in(page) -> bool:
@@ -358,9 +369,12 @@ async def _pw_monitor_async(
     dump_dir = Path(dump_dir); dump_dir.mkdir(parents=True, exist_ok=True)
     console_log_path = dump_dir / f"{session_id}_console.log"
     chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    profile_dir: Optional[Path] = None
     browser = context = page = None
     try:
         async with async_playwright() as p:
+            profile_dir = _make_profile_dir(session_id, dump_dir)
+            chromium_args.append(f"--user-data-dir={profile_dir}")
             browser = await p.chromium.launch(headless=headless, args=chromium_args)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
@@ -438,6 +452,8 @@ async def _pw_monitor_async(
         with contextlib.suppress(Exception):
             if browser:
                 await browser.close()
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
 # --------------- Frappe integration ---------------
 def _run_async(coro):
