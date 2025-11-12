@@ -4,6 +4,11 @@ frappe.ui.form.on('WhatsApp Device', {
         if (!frm.doc.__islocal) {
             const button_label = frm.doc.status === 'Connected' ? 'Refresh QR Code' : 'Generate QR Code';
             frm.add_custom_button(__(button_label), function() {
+                if (frm.__qr_generating) {
+                    frappe.show_alert({ message: __('QR generation in progress...'), indicator: 'blue' }, 3);
+                    return;
+                }
+                frm.__qr_generating = true;
                 // Show loading message
                 frappe.show_alert({
                     message: __('Generating real WhatsApp QR code (quick method)...'),
@@ -14,6 +19,7 @@ frappe.ui.form.on('WhatsApp Device', {
                     method: 'generate_qr_code',
                     doc: frm.doc,
                     callback: function(r) {
+                        frm.__qr_generating = false;
                         if (r.message) {
                             // Reload document to get updated QR data
                             frm.reload_doc().then(() => {
@@ -35,6 +41,7 @@ frappe.ui.form.on('WhatsApp Device', {
                         }
                     },
                     error: function(r) {
+                        frm.__qr_generating = false;
                         frappe.show_alert({
                             message: __('Failed to generate QR code. Check console for details.'),
                             indicator: 'red'

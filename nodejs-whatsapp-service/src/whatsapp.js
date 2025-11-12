@@ -81,7 +81,8 @@ export async function startSession(sessionId) {
         } catch (e) {
           console.error("Failed clearing session directory:", e);
         }
-
+        // Always drop the in-memory session handle so restart can proceed
+        delete sessions[sessionId];
         setTimeout(() => startSession(sessionId), 800);
       } else if (connection === "open") {
         console.log(`WhatsApp session ${sessionId} connected`);
@@ -156,4 +157,3 @@ export function getSessionStatus(sessionId) {
     return "Disconnected";
   }
 }
-

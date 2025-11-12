@@ -116,6 +116,13 @@ class WhatsAppDevice(Document):
         base_url = _get_node_base_url()
         session_id = self.number
 
+        # Prevent duplicate concurrent generation calls (e.g., double-clicks)
+        cache = frappe.cache()
+        lock_key = f"wa_qr_lock::{session_id}"
+        if cache.get_value(lock_key):
+            return {"status": "pending", "message": "QR generation already in progress"}
+        cache.set_value(lock_key, 1, expires_in_sec=20)
+
         try:
             resp = requests.get(f"{base_url}/qr/{session_id}", timeout=20)
             if resp.status_code != 200:
@@ -147,6 +154,11 @@ class WhatsAppDevice(Document):
                 pass
 
             frappe.throw(f"Error generating QR via Node: {str(e)}")
+        finally:
+            try:
+                cache.delete_value(lock_key)
+            except Exception:
+                pass
 
     @frappe.whitelist()
     def get_live_qr(self):
