@@ -67,7 +67,29 @@ QR_WAIT_POLL_INTERVAL = 0.5
 _active_pw_threads: dict[str, threading.Thread] = {}
 _active_pw_stop: dict[str, threading.Event] = {}
 _active_pw_state: dict[str, dict] = {}
+_session_user_hints: dict[str, Optional[str]] = {}
 _pw_lock = threading.Lock()
+
+
+def _current_site_name() -> Optional[str]:
+    if frappe:
+        try:
+            site = getattr(frappe.local, "site", None)
+            if site:
+                return site
+        except Exception:
+            pass
+    env_site = os.environ.get("FRAPPE_SITE")
+    return env_site
+
+
+def _current_session_user() -> Optional[str]:
+    if not frappe:
+        return None
+    try:
+        return getattr(getattr(frappe, "session", None), "user", None)
+    except Exception:
+        return None
 
 # --------------- Small helpers ---------------
 async def _safe_write_text(path: Union[str, Path], text: str) -> None:
@@ -324,6 +346,9 @@ def _ensure_pw_monitor(
     announce: bool = True,
 ) -> None:
     """Start a background Playwright session that keeps QR data fresh."""
+    site_hint = _current_site_name()
+    session_user = _current_session_user()
+    thread: Optional[threading.Thread]
     with _pw_lock:
         thread = _active_pw_threads.get(session_id)
         if thread and thread.is_alive():
@@ -333,14 +358,16 @@ def _ensure_pw_monitor(
         _active_pw_stop[session_id] = stop_event
         thread = threading.Thread(
             target=_pw_monitor_entry,
-            args=(session_id, stop_event, headless, str(dump_dir), qr_timeout_ms),
+            args=(session_id, stop_event, headless, str(dump_dir), qr_timeout_ms, site_hint),
             daemon=True,
             name=f"wa-pw-monitor-{session_id}",
         )
         _active_pw_threads[session_id] = thread
-        if announce:
-            _store_status(session_id, "starting", message="Launching Playwright session")
-        thread.start()
+        if session_user is not None:
+            _session_user_hints[session_id] = session_user
+    if announce:
+        _store_status(session_id, "starting", message="Launching Playwright session")
+    thread.start()
 
 
 def _pw_monitor_entry(
@@ -349,7 +376,16 @@ def _pw_monitor_entry(
     headless: bool,
     dump_dir: str,
     qr_timeout_ms: int,
+    site: Optional[str] = None,
 ) -> None:
+    ctx_initialized = False
+    if frappe and site:
+        try:
+            frappe.init(site=site)
+            ctx_initialized = True
+            frappe.connect()
+        except Exception as exc:
+            sys.stderr.write(f"[PW Monitor] Failed to init frappe site '{site}': {exc}\n")
     try:
         asyncio.run(
             _pw_monitor_async(
@@ -361,9 +397,13 @@ def _pw_monitor_entry(
             )
         )
     finally:
+        if ctx_initialized and frappe:
+            with contextlib.suppress(Exception):
+                frappe.destroy()
         with _pw_lock:
             _active_pw_threads.pop(session_id, None)
             _active_pw_stop.pop(session_id, None)
+            _session_user_hints.pop(session_id, None)
 
 
 async def _pw_monitor_async(
@@ -495,6 +535,9 @@ def _publish_qr_event(session_id: str, status: str, *, b64: Optional[str] = None
             user = getattr(getattr(frappe, "session", None), "user", None)
         except Exception:
             user = None
+        if not user:
+            with _pw_lock:
+                user = _session_user_hints.get(session_id)
         frappe.publish_realtime(
             event="whatsapp_qr",
             message={"device": session_id, "status": status, "qr": b64, "diag": diag},
@@ -634,6 +677,7 @@ if frappe:
         with _pw_lock:
             event = _active_pw_stop.pop(session_id, None)
             thread = _active_pw_threads.pop(session_id, None)
+            _session_user_hints.pop(session_id, None)
         if event:
             event.set()
         if thread and thread.is_alive() and thread is not threading.current_thread():
