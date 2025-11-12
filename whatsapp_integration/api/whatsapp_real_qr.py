@@ -31,6 +31,7 @@ _log_lock = threading.Lock()
 # Centralized log naming/location
 LOG_SUBDIR = 'whatsapp_logs'
 LOG_FILENAME = 'whatsapp_real_qr.log'
+HEADLESS_FALLBACK_MODES = ["--headless=new", "--headless=chrome", "--headless"]
 
 def _resolve_log_base_dir():
     """Resolve base directory used for file logging and a descriptive source label.
@@ -54,8 +55,8 @@ def _resolve_log_base_dir():
             return base_dir, 'cwd'
 
 def _get_log_file_path():
-    """Return path to the file-based log, creating directories as needed.
-
+    """
+    Return path to the file-based log, creating directories as needed.
     Prefers site private files: <site>/private/files/whatsapp_logs/whatsapp_real_qr.log
     Falls back to system temp if frappe context isn't available.
     """
@@ -255,10 +256,35 @@ def _safe_log(message, title="WhatsApp QR Thread"):
     except Exception:
         pass
 
-def _build_chrome_options(user_data_dir=None):
+def _resolve_chrome_binary():
+    """Return path to Chrome/Chromium executable if available."""
+    try:
+        env_path = os.environ.get("WHATSAPP_CHROME_BINARY") or os.environ.get("GOOGLE_CHROME_BIN")
+        if env_path and os.path.exists(env_path):
+            return env_path
+        candidates = [
+            shutil.which("google-chrome"),
+            shutil.which("chromium-browser"),
+            shutil.which("chromium"),
+            shutil.which("chrome"),
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        ]
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+    except Exception as err:
+        _safe_log(f"Chrome binary resolution failed: {err}", "WhatsApp Chrome Resolve")
+    return None
+
+def _build_chrome_options(user_data_dir=None, headless_mode="--headless=new"):
     """Build Chrome options with all necessary arguments"""
     chrome_options = Options()
-    chrome_options.add_argument("--headless=new")  # Use new headless mode
+    if headless_mode:
+        chrome_options.add_argument(headless_mode)  # Use requested headless mode
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
@@ -287,6 +313,12 @@ def _build_chrome_options(user_data_dir=None):
     # Add user data dir if provided
     if user_data_dir:
         chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
+    
+    binary_path = _resolve_chrome_binary()
+    if binary_path:
+        chrome_options.binary_location = binary_path
+    else:
+        _safe_log("Chrome binary not explicitly resolved; relying on system defaults", "WhatsApp Chrome Resolve")
     
     return chrome_options
 
@@ -375,7 +407,8 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
             _safe_log("Running without persistent session directory", "WhatsApp Session Dir")
         
         # Create driver with enhanced error handling and retry logic
-        max_retries = 2
+        headless_modes = HEADLESS_FALLBACK_MODES
+        max_retries = max(3, len(headless_modes))
         driver = None
         last_error = None
         
@@ -384,7 +417,10 @@ def capture_whatsapp_qr(session_id, site_name=None, session_dir=None):
                 # Build chrome options (with or without user-data-dir based on retry)
                 # Use persistent session only on first attempt if it's enabled
                 current_session_dir = effective_session_dir if (attempt == 0 and use_persistent_session) else None
-                chrome_options = _build_chrome_options(user_data_dir=current_session_dir)
+                headless_arg = headless_modes[min(attempt, len(headless_modes) - 1)] if headless_modes else "--headless=new"
+                chrome_options = _build_chrome_options(user_data_dir=current_session_dir, headless_mode=headless_arg)
+                if attempt > 0:
+                    _safe_log(f"Retrying Chrome launch with headless mode '{headless_arg}' (attempt {attempt + 1})", "WhatsApp Chrome Retry")
                 
                 # Install ChromeDriver
                 chromedriver_path = ChromeDriverManager().install()
@@ -872,9 +908,23 @@ def _bootstrap_session_status(session_id):
     """Attempt to determine session status by starting Chrome with persisted profile."""
     try:
         session_dir = get_session_directory(session_id)
-        chrome_options = _build_chrome_options(user_data_dir=session_dir)
-        service = ChromeService(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver = None
+        headless_modes = HEADLESS_FALLBACK_MODES
+        driver_error = None
+        for idx, headless_arg in enumerate(headless_modes):
+            try:
+                chrome_options = _build_chrome_options(user_data_dir=session_dir, headless_mode=headless_arg)
+                service = ChromeService(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                if idx > 0:
+                    _safe_log(f"Bootstrap succeeded with fallback headless mode '{headless_arg}'", "WhatsApp Chrome Retry")
+                break
+            except Exception as err:
+                driver_error = err
+                _safe_log(f"Bootstrap Chrome launch failed with headless mode '{headless_arg}': {err}", "WhatsApp Chrome Error")
+                driver = None
+        if driver is None:
+            raise driver_error or Exception("Chrome could not be started for bootstrap")
         driver.get("https://web.whatsapp.com")
         time.sleep(5)
         try:
@@ -1244,9 +1294,23 @@ def _ensure_driver_for_session(session_id):
         except Exception:
             session_dir = None
 
-        chrome_options = _build_chrome_options(user_data_dir=session_dir)
-        service = ChromeService(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver = None
+        headless_modes = HEADLESS_FALLBACK_MODES
+        launch_error = None
+        for idx, headless_arg in enumerate(headless_modes):
+            try:
+                chrome_options = _build_chrome_options(user_data_dir=session_dir, headless_mode=headless_arg)
+                service = ChromeService(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                if idx > 0:
+                    _safe_log(f"Driver ensure succeeded with fallback headless mode '{headless_arg}'", "WhatsApp Chrome Retry")
+                break
+            except Exception as err:
+                launch_error = err
+                _safe_log(f"Driver ensure failed with headless mode '{headless_arg}': {err}", "WhatsApp Chrome Error")
+                driver = None
+        if driver is None:
+            raise launch_error or Exception("Chrome could not be started for session ensure")
 
         try:
             driver.get("https://web.whatsapp.com")
