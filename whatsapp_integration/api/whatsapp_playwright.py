@@ -28,16 +28,30 @@ def _prepare_playwright_env() -> None:
 			return
 
 		candidates = []
-		# Current user's cache
+		# Linux/macOS common caches
 		candidates.append(os.path.expanduser("~/.cache/ms-playwright"))
-		# Common shared or system locations
 		candidates.extend([
 			"/ms-playwright",
 			"/usr/lib/ms-playwright",
 			"/usr/local/lib/ms-playwright",
+			"/home/frappe/.cache/ms-playwright",
 		])
-		# Known frappe user home on many benches
-		candidates.append("/home/frappe/.cache/ms-playwright")
+
+		# Windows common caches
+		try:
+			userprofile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+			if userprofile:
+				candidates.append(os.path.join(userprofile, "AppData", "Local", "ms-playwright"))
+		except Exception:
+			pass
+		try:
+			programdata = os.environ.get("PROGRAMDATA")
+			if programdata:
+				candidates.append(os.path.join(programdata, "ms-playwright"))
+		except Exception:
+			pass
+		# A simple conventional root path that admins may use
+		candidates.append("C:/ms-playwright")
 
 		for path in candidates:
 			try:
@@ -90,6 +104,21 @@ def _launch_context_with_fallbacks(p, user_data_dir: str, headless: bool = True)
 	except Exception as e:
 		last_err = e
 		_safe_log(f"Playwright channel launch failed: {e}", "WhatsApp PW Launch")
+
+	# Attempt 1b (Windows): try Microsoft Edge channel
+	try:
+		if os.name == "nt":
+			return p.chromium.launch_persistent_context(
+				user_data_dir=user_data_dir,
+				headless=headless,
+				channel="msedge",
+				args=common_args,
+				locale="en-US",
+				user_agent=ua,
+			)
+	except Exception as e:
+		last_err = e
+		_safe_log(f"Playwright msedge launch failed: {e}", "WhatsApp PW Launch")
 
 	# Attempt 2: Default bundled Chromium (requires `playwright install` for this user)
 	try:

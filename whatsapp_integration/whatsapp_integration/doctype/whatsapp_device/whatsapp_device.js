@@ -110,6 +110,40 @@ frappe.ui.form.on('WhatsApp Device', {
                     frappe.show_alert({ message: __('Failed to sync status'), indicator: 'red' }, 5);
                 });
             }, __('Actions'));
+
+            // Send Message (quick compose)
+            frm.add_custom_button(__('Send Message'), function() {
+                const d = new frappe.ui.Dialog({
+                    title: __('Send WhatsApp Message'),
+                    fields: [
+                        { label: __('Number'), fieldname: 'number', fieldtype: 'Data', default: frm.doc.number, reqd: true, description: __('Include country code, digits only or mixed') },
+                        { label: __('Message'), fieldname: 'message', fieldtype: 'Small Text', reqd: true },
+                    ],
+                    primary_action_label: __('Send'),
+                    primary_action(values) {
+                        if (!values || !values.number || !values.message) { return; }
+                        frappe.call({
+                            method: 'whatsapp_integration.api.whatsapp.send_whatsapp_message',
+                            args: { number: values.number, message: values.message },
+                        }).then((r) => {
+                            frappe.show_alert({ message: __('Message sent'), indicator: 'green' }, 5);
+                            d.hide();
+                        }).catch((err) => {
+                            frappe.show_alert({ message: __('Failed to send message'), indicator: 'red' }, 7);
+                        });
+                    }
+                });
+                d.show();
+            }, __('Actions'));
+
+            // Open Message Logs filtered by this device/number
+            frm.add_custom_button(__('Message Logs'), function() {
+                if (frm.doc.number) {
+                    frappe.set_route('List', 'WhatsApp Message Log', { number: frm.doc.number });
+                } else {
+                    frappe.set_route('List', 'WhatsApp Message Log');
+                }
+            }, __('Actions'));
         }
         
         // Add Troubleshoot button for linking issues
