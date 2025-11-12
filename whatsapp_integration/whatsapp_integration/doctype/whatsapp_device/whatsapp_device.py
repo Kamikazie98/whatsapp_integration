@@ -148,6 +148,48 @@ class WhatsAppDevice(Document):
 
             frappe.throw(f"Error generating QR via Node: {str(e)}")
 
+    @frappe.whitelist()
+    def get_live_qr(self):
+        """Fetch latest QR from Node service (handles rotating QR)."""
+        try:
+            base_url = _get_node_base_url()
+            session_id = self.number
+            resp = requests.get(f"{base_url}/qr/{session_id}", timeout=15)
+            if resp.status_code != 200:
+                return {"status": "error", "message": f"Node HTTP {resp.status_code}"}
+            data = resp.json()
+            qr = data.get("qr")
+            if not qr:
+                return {"status": "pending", "message": "QR not yet available"}
+            # Update stored QR for inline renderers
+            self.qr_code = qr
+            if self.status != "Connected":
+                self.status = "QR Generated"
+            self.save()
+            return {"status": "qr_generated", "qr": qr}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    @frappe.whitelist()
+    def check_node_status(self):
+        """Check Node session status and update device if connected."""
+        try:
+            base_url = _get_node_base_url()
+            session_id = self.number
+            resp = requests.get(f"{base_url}/status/{session_id}", timeout=10)
+            if resp.status_code != 200:
+                return {"status": "error", "message": f"Node HTTP {resp.status_code}"}
+            data = resp.json() if resp.headers.get('content-type','').startswith('application/json') else {"status": resp.text}
+            status = (data.get("status") or "").lower()
+            if status == "connected" and self.status != "Connected":
+                self.status = "Connected"
+                # Clear QR once connected
+                self.qr_code = None
+                self.save()
+            return {"status": status or "unknown"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     def test_connection(self):
         """Test WhatsApp connection status"""
         try:

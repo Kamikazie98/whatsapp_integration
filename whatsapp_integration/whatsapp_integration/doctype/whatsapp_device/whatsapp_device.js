@@ -254,6 +254,39 @@ function show_qr_dialog(qr_data, device_number, frm) {
         }
     });
     dialog.show();
+
+    // Poll latest QR (rotates on WhatsApp Web) and connection status while dialog is open
+    const pollIntervalMs = 8000; // 8s
+    const poll = () => {
+        if (!frm || frm.is_new()) return;
+        frm.call('get_live_qr').then(r => {
+            const msg = r && r.message;
+            if (msg && msg.status === 'qr_generated' && msg.qr) {
+                const imgEl = dialog.$wrapper.find('#qr-container img')[0];
+                if (imgEl) { imgEl.src = msg.qr; }
+            }
+        }).catch(() => {});
+        frm.call('check_node_status').then(r => {
+            if (r && r.message && r.message.status === 'connected') {
+                clearInterval(dialog.__qr_timer);
+                frappe.msgprint({
+                    title: __('Connected'),
+                    message: __('WhatsApp device is now connected.'),
+                    indicator: 'green'
+                });
+                dialog.hide();
+                frm.reload_doc();
+            }
+        }).catch(() => {});
+    };
+    dialog.__qr_timer = setInterval(poll, pollIntervalMs);
+    // Clean up when dialog closes
+    dialog.$wrapper.on('hidden.bs.modal', () => {
+        if (dialog.__qr_timer) {
+            clearInterval(dialog.__qr_timer);
+            dialog.__qr_timer = null;
+        }
+    });
 }
 
 function display_qr_inline(frm) {
@@ -316,29 +349,25 @@ function display_qr_inline(frm) {
 }
 
 function setup_auto_refresh(frm) {
-    // Auto-refresh every 15 seconds for QR Generated devices
+    // Auto-refresh every 12 seconds for QR Generated devices
     if (frm.auto_refresh_timer) {
         clearInterval(frm.auto_refresh_timer);
     }
     
     frm.auto_refresh_timer = setInterval(function() {
         if (frm.doc.status === 'QR Generated') {
-            frappe.call({
-                method: 'whatsapp_integration.api.whatsapp_real_qr.check_qr_status',
-                args: {
-                    session_id: frm.doc.number
-                },
-                callback: function(r) {
-                    if (r.message && r.message.status === 'connected') {
-                        clearInterval(frm.auto_refresh_timer);
-                        frm.reload_doc();
-                    }
+            // Pull latest QR and status via server (avoids CORS to Node)
+            frm.call('get_live_qr');
+            frm.call('check_node_status').then(r => {
+                if (r.message && r.message.status === 'connected') {
+                    clearInterval(frm.auto_refresh_timer);
+                    frm.reload_doc();
                 }
             });
         } else {
             clearInterval(frm.auto_refresh_timer);
         }
-    }, 15000); // Check every 15 seconds
+    }, 12000); // Check every 12 seconds
 }
 
 // Clean up timer when form is destroyed
