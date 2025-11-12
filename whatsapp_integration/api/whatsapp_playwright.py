@@ -67,6 +67,8 @@ QR_WAIT_POLL_INTERVAL = 0.5
 _active_pw_threads: dict[str, threading.Thread] = {}
 _active_pw_stop: dict[str, threading.Event] = {}
 _active_pw_state: dict[str, dict] = {}
+_active_pw_profiles: dict[str, Path] = {}
+_session_dump_dirs: dict[str, Path] = {}
 _session_user_hints: dict[str, Optional[str]] = {}
 _pw_lock = threading.Lock()
 
@@ -168,10 +170,15 @@ def _store_status(
     ttl: int = QR_MONITOR_SECS + 60,
 ) -> dict:
     """Persist the latest status in both in-memory map and frappe cache."""
+    prev = _active_pw_state.get(session_id, {})
     payload = {"status": status, "session": session_id}
     if qr:
         payload["qr"] = qr
         payload.setdefault("qr_data", qr)
+    elif prev.get("qr"):
+        payload["qr"] = prev["qr"]
+        if prev.get("qr_data"):
+            payload["qr_data"] = prev["qr_data"]
     if message:
         payload["message"] = message
     if diag:
@@ -183,14 +190,37 @@ def _store_status(
     return payload
 
 
-def _make_profile_dir(session_id: str, dump_dir: Union[str, Path]) -> Path:
-    """Create a unique Chrome profile directory per monitor run."""
+def _profile_dir_path(session_id: str, dump_dir: Union[str, Path]) -> Path:
     base = Path(dump_dir) / "pw_profiles"
-    base.mkdir(parents=True, exist_ok=True)
     safe = session_id.replace("/", "_").replace("\\", "_")
-    profile = base / f"{safe}_{int(time.time() * 1000)}"
+    return base / safe
+
+
+def _session_profile_dir(session_id: str, dump_dir: Union[str, Path]) -> Path:
+    """Return a stable Chrome profile directory per logical session."""
+    profile = _profile_dir_path(session_id, dump_dir)
+    profile.parent.mkdir(parents=True, exist_ok=True)
     profile.mkdir(parents=True, exist_ok=True)
     return profile
+
+
+def _wait_for_status(
+    session_id: str,
+    targets: set[str],
+    timeout_s: float,
+) -> Optional[dict]:
+    """Poll cache until one of the desired statuses (or error/connected) appear."""
+    deadline = time.time() + max(timeout_s, 0)
+    while time.time() < deadline:
+        payload = _cache_get(session_id)
+        if payload:
+            state = payload.get("status")
+            if state in targets:
+                return payload
+            if state in {"error"}:
+                return payload
+        time.sleep(QR_WAIT_POLL_INTERVAL)
+    return _cache_get(session_id)
 
 # --------------- Playwright core ---------------
 async def _is_logged_in(page) -> bool:
@@ -354,11 +384,17 @@ def _ensure_pw_monitor(
         if thread and thread.is_alive():
             return
 
+        dump_path = Path(dump_dir)
+        dump_path.mkdir(parents=True, exist_ok=True)
+        _session_dump_dirs[session_id] = dump_path
+        profile_dir = _session_profile_dir(session_id, dump_path)
+        _active_pw_profiles[session_id] = profile_dir
+
         stop_event = threading.Event()
         _active_pw_stop[session_id] = stop_event
         thread = threading.Thread(
             target=_pw_monitor_entry,
-            args=(session_id, stop_event, headless, str(dump_dir), qr_timeout_ms, site_hint),
+            args=(session_id, stop_event, headless, str(dump_path), qr_timeout_ms, site_hint, str(profile_dir)),
             daemon=True,
             name=f"wa-pw-monitor-{session_id}",
         )
@@ -377,6 +413,7 @@ def _pw_monitor_entry(
     dump_dir: str,
     qr_timeout_ms: int,
     site: Optional[str] = None,
+    profile_dir: Optional[str] = None,
 ) -> None:
     ctx_initialized = False
     if frappe and site:
@@ -394,6 +431,7 @@ def _pw_monitor_entry(
                 headless=headless,
                 dump_dir=dump_dir,
                 qr_timeout_ms=qr_timeout_ms,
+                profile_dir=profile_dir,
             )
         )
     finally:
@@ -413,6 +451,7 @@ async def _pw_monitor_async(
     headless: bool,
     dump_dir: Union[str, Path],
     qr_timeout_ms: int,
+    profile_dir: Optional[Union[str, Path]] = None,
 ) -> None:
     """Long-lived Playwright session that refreshes QR when WhatsApp rotates it."""
     from playwright.async_api import async_playwright
@@ -420,12 +459,14 @@ async def _pw_monitor_async(
     dump_dir = Path(dump_dir); dump_dir.mkdir(parents=True, exist_ok=True)
     console_log_path = dump_dir / f"{session_id}_console.log"
     chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
-    profile_dir: Optional[Path] = None
+    profile_path = Path(profile_dir) if profile_dir else _session_profile_dir(session_id, dump_dir)
+    profile_path.mkdir(parents=True, exist_ok=True)
+    with _pw_lock:
+        _active_pw_profiles[session_id] = profile_path
     browser = context = page = None
     try:
         async with async_playwright() as p:
-            profile_dir = _make_profile_dir(session_id, dump_dir)
-            chromium_args.append(f"--user-data-dir={profile_dir}")
+            chromium_args.append(f"--user-data-dir={profile_path}")
             browser = await p.chromium.launch(headless=headless, args=chromium_args)
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 900},
@@ -454,20 +495,33 @@ async def _pw_monitor_async(
 
             monitor_deadline = time.time() + QR_MONITOR_SECS
             misses = 0
+            connected = False
 
             while not stop_event.is_set():
-                if time.time() > monitor_deadline:
-                    break
-
                 with contextlib.suppress(Exception):
                     if await _is_logged_in(page):
-                        _store_status(
-                            session_id,
-                            "connected",
-                            message="Successfully connected to WhatsApp",
-                            publish=True,
-                        )
-                        return
+                        if not connected:
+                            connected = True
+                            _store_status(
+                                session_id,
+                                "connected",
+                                message="Successfully connected to WhatsApp",
+                                publish=True,
+                            )
+                        await asyncio.sleep(5)
+                        continue
+                    if connected:
+                        # Lost connection -> force QR screen again
+                        connected = False
+                        monitor_deadline = time.time() + QR_MONITOR_SECS
+                        await _logout_if_needed(page)
+
+                if not connected and time.time() > monitor_deadline:
+                    break
+
+                if connected:
+                    await asyncio.sleep(5)
+                    continue
 
                 fresh_qr = await _snapshot_qr_once(page)
                 if fresh_qr:
@@ -503,18 +557,20 @@ async def _pw_monitor_async(
         with contextlib.suppress(Exception):
             if browser:
                 await browser.close()
-        if profile_dir:
-            shutil.rmtree(profile_dir, ignore_errors=True)
+        with _pw_lock:
+            _active_pw_profiles.pop(session_id, None)
 
 # --------------- Frappe integration ---------------
 def _run_async(coro):
     try:
-        loop = asyncio.get_event_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
         return asyncio.run(coro)
-    return asyncio.run(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 def _log_error(title: str, detail: str) -> None:
     title = (title or "Error")[:140]
@@ -552,40 +608,27 @@ if frappe:
     def get_qr_data_url(device_name: str = "default", headless: int = 1, dump_dir: str = DEFAULT_DUMP_DIR) -> Optional[str]:
         """Generate QR and publish. Returns data-url string or None."""
         qr_timeout_ms = 90_000
-        try:
-            data_url, diag = _run_async(generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir))
-        except Exception as e:
-            msg = f"{e}"
-            _log_error("PW generate error", msg[:2000])
-            _store_status(device_name, "error", message=msg, diag=None, publish=True)
-            return None
-
-        if not data_url:
-            _log_error("QR Generation Error", f"debug:{diag}")
-            _store_status(
-                device_name,
-                "error",
-                message="QR not found (Playwright)",
-                diag=diag,
-                publish=True,
-            )
-            return None
-
-        _store_status(
-            device_name,
-            "qr_generated",
-            qr=data_url,
-            message="QR code ready",
-            publish=True,
-        )
         _ensure_pw_monitor(
             device_name,
             headless=bool(int(headless)),
             dump_dir=dump_dir,
             qr_timeout_ms=qr_timeout_ms,
-            announce=False,
         )
-        return data_url
+        result = _wait_for_status(
+            device_name,
+            targets={"qr_generated", "connected", "error"},
+            timeout_s=qr_timeout_ms / 1000.0,
+        )
+        if not result:
+            return None
+        status = result.get("status")
+        if status == "qr_generated":
+            return result.get("qr") or result.get("qr_data")
+        if status == "connected":
+            return None
+        if status == "error":
+            return None
+        return None
 
 # --------------- Backward-compatible APIs ---------------
 if frappe:
@@ -607,41 +650,6 @@ if frappe:
         if isinstance(timeout, (int, float)) and timeout > 0:
             qr_timeout_ms = int(float(timeout) * 1000)
 
-        try:
-            data_url, diag = _run_async(
-                generate_qr_base64(headless=bool(int(headless)), dump_dir=dump_dir, qr_timeout_ms=qr_timeout_ms)
-            )
-        except Exception as e:
-            msg = f"{e}"
-            _log_error("PW generate error", msg[:2000])
-            res = _store_status(
-                session_id,
-                "error",
-                message=msg,
-                diag=None,
-                publish=True,
-            )
-            return res
-
-        if not data_url:
-            _log_error("QR Generation Error", f"debug:{diag}")
-            res = _store_status(
-                session_id,
-                "error",
-                message="QR not found (Playwright)",
-                diag=diag,
-                publish=True,
-            )
-            return res
-
-        res = _store_status(
-            session_id,
-            "qr_generated",
-            qr=data_url,
-            message="QR code ready",
-            publish=True,
-        )
-
         _ensure_pw_monitor(
             session_id,
             headless=bool(int(headless)),
@@ -649,7 +657,14 @@ if frappe:
             qr_timeout_ms=qr_timeout_ms,
             announce=False,
         )
-        return res
+        wait_payload = _wait_for_status(
+            session_id,
+            targets={"qr_generated", "connected", "error"},
+            timeout_s=qr_timeout_ms / 1000.0,
+        )
+        if wait_payload:
+            return wait_payload
+        return {"status": "waiting", "session": session_id, "message": "QR generation timed out"}
 
     @frappe.whitelist()
     def check_qr_status_pw(session_id: str) -> dict:
@@ -674,16 +689,25 @@ if frappe:
         """Optional: clear cache after success or when starting over."""
         thread = None
         event = None
+        profile_dir: Optional[Path] = None
+        dump_dir: Optional[Path] = None
         with _pw_lock:
             event = _active_pw_stop.pop(session_id, None)
             thread = _active_pw_threads.pop(session_id, None)
             _session_user_hints.pop(session_id, None)
+            profile_dir = _active_pw_profiles.pop(session_id, None)
+            dump_dir = _session_dump_dirs.pop(session_id, None)
         if event:
             event.set()
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2)
         _active_pw_state.pop(session_id, None)
         _cache_clear(session_id)
+        cleanup_path = profile_dir
+        if not cleanup_path and dump_dir:
+            cleanup_path = _profile_dir_path(session_id, dump_dir)
+        if cleanup_path:
+            shutil.rmtree(cleanup_path, ignore_errors=True)
 
 # --------------- Optional CLI smoke test ---------------
 def _print(msg: str) -> None:
