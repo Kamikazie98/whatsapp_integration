@@ -107,7 +107,14 @@ function show_qr_dialog(qr_data, device_number, frm) {
                             frm.reload_doc();
                         }
                     } else if (r.message && r.message.status === 'qr_ready') {
-                        frappe.msgprint(__('QR code is ready for scanning'));
+                        const fresh = r.message.qr || r.message.qr_data;
+                        if (fresh) {
+                            const img = dialog.$wrapper.find('img');
+                            if (img && img.length && img.attr('src') !== fresh) {
+                                img.attr('src', fresh);
+                            }
+                        }
+                        frappe.msgprint(__('QR code refreshed. Keep scanning.'));
                     } else {
                         frappe.msgprint(__('Device not connected yet. Please scan the QR code.'));
                     }
@@ -162,6 +169,14 @@ function setup_auto_refresh(frm) {
                     if (r.message && r.message.status === 'connected') {
                         clearInterval(frm.auto_refresh_timer);
                         frm.reload_doc();
+                    } else if (r.message) {
+                        const fresh = r.message.qr || r.message.qr_data;
+                        if (fresh) {
+                            const img = $(frm.wrapper).find('.qr-code-container img');
+                            if (img && img.length && img.attr('src') !== fresh) {
+                                img.attr('src', fresh);
+                            }
+                        }
                     }
                 }
             });

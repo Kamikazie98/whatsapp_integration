@@ -6,7 +6,7 @@ frappe.ui.form.on('WhatsApp Device', {
             frm.add_custom_button(__(button_label), function() {
                 // Show loading message
                 frappe.show_alert({
-                    message: __('Generating real WhatsApp QR code (quick method)...'),
+                    message: __('Generating WhatsApp QR code (Playwright headless)...'),
                     indicator: 'blue'
                 }, 3);
                 
@@ -85,8 +85,8 @@ frappe.ui.form.on('WhatsApp Device', {
                             frappe.msgprint({
                                 title: __('WhatsApp Connection Status'),
                                 message: message,
-                                indicator: status.status === 'connected' ? 'green' : 
-                                          status.status === 'qr_generated' ? 'blue' : 'red'
+                                indicator: status.status === 'connected' ? 'green' :
+                                          (status.status === 'qr_generated' || status.status === 'qr_ready') ? 'blue' : 'red'
                             });
                         }
                     },
@@ -235,11 +235,24 @@ function show_qr_dialog(qr_data, device_number, frm) {
                         if (frm) {
                             frm.reload_doc();
                         }
+                    } else if (r.message && r.message.status === 'qr_ready') {
+                        const fresh = r.message.qr || r.message.qr_data;
+                        if (fresh) {
+                            const img = dialog.$wrapper.find('#qr-dialog-img');
+                            if (img && img.length && img.attr('src') !== fresh) {
+                                img.attr('src', fresh);
+                            }
+                        }
+                        frappe.msgprint({
+                            title: __('QR Ready'),
+                            message: __('QR code refreshed. Keep this dialog open and scan with your phone.'),
+                            indicator: 'blue'
+                        });
                     } else {
                         frappe.msgprint({
                             title: __('Not Connected Yet'),
                             message: __('Please scan the QR code with your phone first.'),
-                            indicator: 'blue'
+                            indicator: 'orange'
                         });
                     }
                 }
@@ -277,12 +290,13 @@ function show_qr_dialog(qr_data, device_number, frm) {
                     if (frm) frm.reload_doc();
                     return;
                 }
-                if (data.qr_data) {
+                const latest = data.qr_data || data.qr;
+                if (latest) {
                     const img = dialog.$wrapper.find('#qr-dialog-img');
                     if (img && img.length) {
                         const current = img.attr('src');
-                        if (current !== data.qr_data) {
-                            img.attr('src', data.qr_data);
+                        if (current !== latest) {
+                            img.attr('src', latest);
                         }
                     }
                 }

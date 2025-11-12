@@ -49,9 +49,10 @@ class WhatsAppDevice(Document):
 							self.qr_code = qr
 						self.save()
 					return {
-						"status": "qr_generated",
+						"status": "qr_ready" if st == "qr_ready" else "qr_generated",
 						"message": f"QR code generated for {self.number}. Please scan to connect.",
-						"device_number": self.number
+						"device_number": self.number,
+						"qr": status_payload.get("qr") or status_payload.get("qr_data")
 					}
 				if st in ("error", "not_found") and self.status != "Connected":
 					if self.status != "Disconnected":

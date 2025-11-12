@@ -86,7 +86,11 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 			# Already connected?
 			if page.query_selector("[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']"):
 				browser.close()
-				return {"status": "already_connected", "session": session_id}
+				return {
+					"status": "already_connected",
+					"session": session_id,
+					"message": "WhatsApp session already connected",
+				}
 
 			# Find QR
 			start = time.time()
@@ -104,15 +108,16 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 			# Keep browser context alive briefly so user can scan
 			# We don't block here; client can poll status
 			return {
-				"status": "qr_generated",
+				"status": "qr_ready",
 				"qr": qr_data,
+				"qr_data": qr_data,
 				"session": session_id,
 				"message": "WhatsApp QR (Playwright) generated",
 				"session_dir": user_data_dir,
 			}
 	except Exception as e:
 		_safe_log(f"PW generate error: {e}", "WhatsApp PW QR")
-		return {"status": "error", "message": str(e)}
+		return {"status": "error", "message": str(e), "session": session_id}
 
 
 @frappe.whitelist()
@@ -134,16 +139,30 @@ def check_qr_status_pw(session_id: str):
 
 			if page.query_selector("[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']"):
 				browser.close()
-				return {"status": "connected", "session": session_id}
+				return {
+					"status": "connected",
+					"session": session_id,
+					"message": "WhatsApp session already connected",
+				}
 
 			qr = _extract_qr_from_page(page)
 			browser.close()
 			if qr:
-				return {"status": "qr_ready", "qr_data": qr, "session": session_id}
-			return {"status": "not_found", "session": session_id}
+				return {
+					"status": "qr_ready",
+					"qr": qr,
+					"qr_data": qr,
+					"session": session_id,
+					"message": "QR available - scan to connect",
+				}
+			return {"status": "not_found", "session": session_id, "message": "QR not found in current session"}
 	except Exception as e:
 		_safe_log(f"PW status error: {e}", "WhatsApp PW QR")
-		return {"status": "error", "message": str(e)}
+		return {
+			"status": "error",
+			"message": str(e),
+			"session": session_id,
+		}
 
 
 @frappe.whitelist()
