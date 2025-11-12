@@ -159,8 +159,11 @@ def _extract_qr_from_page(page) -> str | None:
 			"canvas[data-ref]",
 			"div[data-ref] canvas",
 			"[data-testid='qrcode'] canvas",
+			"[data-testid='qrcode'] > canvas",
 			"canvas[aria-label*='QR']",
 			".landing-window canvas",
+			".landing-wrapper canvas",
+			".landing-window [role='img'] canvas",
 		]
 		canvas = None
 		for sel in selectors:
@@ -197,34 +200,66 @@ def _extract_qr_from_page(page) -> str | None:
 	return None
 
 
+def _maybe_dismiss_and_reload_qr(page) -> None:
+	"""Best-effort: close interstitials and refresh QR if a control is present."""
+	try:
+		# Cookie/intro prompts
+		for sel in [
+			"button:has-text('Use Here')",
+			"button:has-text('Continue')",
+			"button:has-text('OK')",
+			"button:has-text('Accept')",
+			"[data-testid='accept']",
+		]:
+			el = page.query_selector(sel)
+			if el:
+				el.click()
+				time.sleep(0.3)
+	except Exception:
+		pass
+	# Try to reload QR if such a button exists
+	for sel in [
+		"[aria-label*='reload QR']",
+		"[aria-label*='Reload']",
+		"[data-testid*='refresh']",
+		"button:has-text('Reload')",
+		"button:has-text('Refresh')",
+		"span:has-text('Click to reload QR code')",
+	]:
+		try:
+			btn = page.query_selector(sel)
+			if btn:
+				btn.click()
+				time.sleep(0.5)
+				break
+		except Exception:
+			pass
+
+
 @frappe.whitelist()
 def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
-	"""Generate QR with Playwright (headless, persistent profile)."""
-	user_data_dir = _resolve_user_data_dir(session_id)
-	_prepare_playwright_env()
-	try:
-		with sync_playwright() as p:
-			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=True)
+    """Generate QR with Playwright (headless, persistent profile)."""
+    user_data_dir = _resolve_user_data_dir(session_id)
+    _prepare_playwright_env()
+    try:
+        with sync_playwright() as p:
+			# Allow headful debug via env: WHATSAPP_PW_HEADLESS=0 or 'false'
+			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
+			headless = not (h_env in {"0", "false", "no"})
+			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
 			page = browser.new_page()
 			page.set_default_timeout(15000)
-			page.goto("https://web.whatsapp.com", wait_until="networkidle")
+			page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
 			# quick settle
 			time.sleep(2)
+			# extra settle for heavy first load
+			try:
+				page.wait_for_load_state("networkidle", timeout=15000)
+			except Exception:
+				pass
 
 			# Handle occasional interstitials/cookie prompts quietly
-			for sel in [
-				"button:has-text('Use Here')",
-				"button:has-text('Continue')",
-				"button:has-text('OK')",
-				"button:has-text('Accept')",
-			]:
-				try:
-					el = page.query_selector(sel)
-					if el:
-						el.click()
-						time.sleep(0.5)
-				except Exception:
-					pass
+			_maybe_dismiss_and_reload_qr(page)
 
 			# Already connected?
 			if page.query_selector("[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']"):
@@ -238,14 +273,22 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 			# Find QR
 			start = time.time()
 			qr_data = None
-			# Try waiting briefly for common QR containers
-			for sel in ["[data-testid='qrcode'] canvas", "div[data-ref] canvas", "canvas[data-ref]"]:
+			# Try waiting for QR containers or any viable canvas
+			wait_targets = [
+				"[data-testid='qrcode'] canvas",
+				"div[data-ref] canvas",
+				"canvas[data-ref]",
+				".landing-window canvas",
+				"canvas",
+			]
+			for sel in wait_targets:
 				try:
 					page.wait_for_selector(sel, state="visible", timeout=5000)
 					break
 				except Exception:
 					pass
 			while time.time() - start < timeout:
+				_maybe_dismiss_and_reload_qr(page)
 				qr_data = _extract_qr_from_page(page)
 				if qr_data:
 					break
@@ -253,18 +296,19 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 
 			if not qr_data:
 				# Capture diagnostic screenshot
+				diag_path = None
 				try:
 					shot = page.screenshot(full_page=True)
 					diag_dir = _resolve_user_data_dir(f"diag_{session_id}")
 					os.makedirs(diag_dir, exist_ok=True)
-					shot_path = os.path.join(diag_dir, f"whatsapp_qr_not_found_{int(time.time())}.png")
-					with open(shot_path, "wb") as f:
+					diag_path = os.path.join(diag_dir, f"whatsapp_qr_not_found_{int(time.time())}.png")
+					with open(diag_path, "wb") as f:
 						f.write(shot)
-					_safe_log(f"QR not found; saved screenshot at {shot_path}", "WhatsApp PW QR")
+					_safe_log(f"QR not found; saved screenshot at {diag_path}", "WhatsApp PW QR")
 				except Exception as diag_err:
 					_safe_log(f"Failed to save diagnostic screenshot: {diag_err}", "WhatsApp PW QR")
 				browser.close()
-				raise Exception("QR element not found (PW)")
+				raise Exception(f"QR element not found (PW){' | debug:' + diag_path if diag_path else ''}")
 
 			# Keep browser context alive briefly so user can scan
 			# We don't block here; client can poll status
@@ -285,14 +329,20 @@ def generate_whatsapp_qr_pw(session_id: str, timeout: int = 60):
 def check_qr_status_pw(session_id: str):
 	"""Check connection or refresh QR with Playwright using persisted profile."""
 	user_data_dir = _resolve_user_data_dir(session_id)
-	_prepare_playwright_env()
-	try:
-		with sync_playwright() as p:
-			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=True)
+    _prepare_playwright_env()
+    try:
+        with sync_playwright() as p:
+			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
+			headless = not (h_env in {"0", "false", "no"})
+			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
 			page = browser.new_page()
 			page.set_default_timeout(15000)
 			page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
 			time.sleep(2)
+			try:
+				page.wait_for_load_state("networkidle", timeout=15000)
+			except Exception:
+				pass
 
 			if page.query_selector("[data-testid='chat-list'], [data-testid='sidebar'], [data-testid='pane-side'], [data-testid='conversation-panel-body']"):
 				browser.close()
@@ -302,6 +352,7 @@ def check_qr_status_pw(session_id: str):
 					"message": "WhatsApp session already connected",
 				}
 
+			_maybe_dismiss_and_reload_qr(page)
 			qr = _extract_qr_from_page(page)
 			browser.close()
 			if qr:
@@ -327,15 +378,17 @@ def send_message_pw(session_id: str, phone_number: str, message: str):
 	"""Send message via Playwright (requires linked device in this profile)."""
 	user_data_dir = _resolve_user_data_dir(session_id)
 	_prepare_playwright_env()
-	try:
+    try:
 		dest = "".join(filter(str.isdigit, phone_number or ""))
 		if not dest:
 			return {"success": False, "error": "Invalid destination number"}
 		text = urllib.parse.quote(message or "")
 		chat_url = f"https://web.whatsapp.com/send?phone={dest}&text={text}"
 
-		with sync_playwright() as p:
-			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=True)
+        with sync_playwright() as p:
+			h_env = (os.environ.get("WHATSAPP_PW_HEADLESS") or "1").lower()
+			headless = not (h_env in {"0", "false", "no"})
+			browser = _launch_context_with_fallbacks(p, user_data_dir, headless=headless)
 			page = browser.new_page()
 			page.set_default_timeout(20000)
 			page.goto(chat_url, wait_until="domcontentloaded")
