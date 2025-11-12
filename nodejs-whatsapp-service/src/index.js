@@ -1,4 +1,19 @@
 import 'dotenv/config';
+// Ensure a global `crypto` is available for libraries expecting it
+// Some environments/libraries reference a global `crypto` (Node module), not webcrypto
+import * as nodeCrypto from 'crypto';
+try {
+  // If globalThis.crypto is missing or not the Node crypto module, set it
+  // Baileys may reference `crypto` directly (hkdfSync, etc.)
+  // Assigning Node's crypto module ensures those APIs exist
+  if (!globalThis.crypto || !('hkdfSync' in globalThis.crypto)) {
+    // @ts-ignore - assigning for runtime compatibility
+    globalThis.crypto = nodeCrypto;
+  }
+} catch (e) {
+  // If crypto import fails, log and continue (service will still start, but BAILEYS may fail)
+  console.error('Crypto polyfill failed to initialize:', e);
+}
 import express from "express";
 import bodyParser from "body-parser";
 import { startSession, sendMessage, getQR, getSessionStatus } from "./whatsapp.js";
