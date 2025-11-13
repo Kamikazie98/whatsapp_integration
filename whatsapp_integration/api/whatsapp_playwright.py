@@ -606,22 +606,27 @@ async def _send_message_pw_async(
                 await _persist_storage_state(context, session_id, dump_dir)
 
             send_selectors = [
-                "[data-testid='send']",
-                "button[aria-label='Send']",
-                "[data-testid='compose-btn-send']",
+                "button[aria-label*='Send']",          # Covers "Send" and "Send message"
+                "span[data-icon='send']",              # Icon-based selector
+                "button[data-testid='compose-btn-send']", # Test ID
             ]
-            for sel in send_selectors:
+            _log_info(f"Attempting to find send button for session '{session_id}'...")
+            for i, sel in enumerate(send_selectors):
                 try:
+                    _log_info(f"  -> Trying send selector #{i+1}: {sel}")
                     btn = page.locator(sel).first
-                    await btn.wait_for(state="visible", timeout=timeout_s * 1000)
+                    await btn.wait_for(state="visible", timeout=(timeout_s * 1000) // len(send_selectors))
                     await btn.click()
+                    _log_info("Send button clicked successfully.")
                     break
-                except Exception:
+                except Exception as exc:
+                    _log_info(f"Selector failed: {exc.__class__.__name__}")
                     continue
             else:
+                _log_error(f"Failed to find send button for session '{session_id}'", "All selectors failed.")
                 return {"success": False, "error": "Send button not found"}
 
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
             if not timestamp:
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
             return {
@@ -827,31 +832,32 @@ async def _pw_monitor_async(
             connected = False
 
             while not stop_event.is_set():
-                with contextlib.suppress(Exception):
-                    if await _is_logged_in(page):
-                        if not connected:
-                            connected = True
-                            await _persist_storage_state(context, session_id, dump_dir)
-                            _store_status(
-                                session_id,
-                                "connected",
-                                message="Successfully connected to WhatsApp",
-                                publish=True,
-                            )
-                        await asyncio.sleep(5)
-                        continue
-                    if connected:
-                        # Lost connection -> force QR screen again
-                        connected = False
-                        monitor_deadline = time.time() + QR_MONITOR_SECS
-                        await _logout_if_needed(page)
-
-                if not connected and time.time() > monitor_deadline:
-                    break
-
-                if connected:
-                    await asyncio.sleep(5)
+                if await _is_logged_in(page):
+                    if not connected:
+                        _log_info(f"Session '{session_id}' is now connected.")
+                        connected = True
+                        await _persist_storage_state(context, session_id, dump_dir)
+                        _store_status(
+                            session_id,
+                            "connected",
+                            message="Successfully connected to WhatsApp",
+                            publish=True,
+                        )
+                    # Keep session alive and reset monitor deadline
+                    monitor_deadline = time.time() + QR_MONITOR_SECS
+                    await asyncio.sleep(15)  # Check login status every 15s
                     continue
+
+                # If we reach here, we are not logged in
+                if connected:
+                    _log_error(f"Session '{session_id}' lost connection.", "Attempting to get a new QR code.")
+                    connected = False
+                    monitor_deadline = time.time() + QR_MONITOR_SECS
+                    await _logout_if_needed(page)
+
+                if time.time() > monitor_deadline:
+                    _log_error(f"QR monitoring for '{session_id}' timed out.", "Thread will now exit.")
+                    break
 
                 fresh_qr = await _snapshot_qr_once(page)
                 if fresh_qr:
