@@ -19,6 +19,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import logging
 import os
 import shutil
 import sys
@@ -27,6 +28,23 @@ import time
 import urllib.parse
 from pathlib import Path
 from typing import Optional, Tuple, Union
+
+# ---- Dedicated File Logger ---
+LOG_FILE = "/tmp/whatsapp_integration_playwright.log"
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+)
+wa_logger = logging.getLogger("whatsapp_playwright")
+wa_logger.setLevel(logging.DEBUG)
+# Avoid duplicate handlers if the script is reloaded
+if not wa_logger.handlers:
+    wa_logger.addHandler(file_handler)
+# ---- End Logger ----
+
 
 # ---- Failsafe: ensure Playwright browsers path & HOME are correct for bench ----
 os.environ.setdefault("HOME", "/home/frappe")
@@ -878,25 +896,25 @@ def _run_async(coro):
 
 
 def _log_info(title: str, detail: str | None = None) -> None:
-    title = (title or "Info")[:140]
+    msg = f"{title}{f' - {detail}' if detail else ''}"
+    wa_logger.info(msg)
     if not frappe:
-        sys.stdout.write(f"[INFO] {title}\n{detail or ''}\n")
         return
     try:
         frappe.logger("whatsapp").info(title, detail)
     except Exception:
-        sys.stdout.write(f"[FRAPPE LOG INFO FAILED] {title}\n{detail or ''}\n")
+        pass
 
 
 def _log_error(title: str, detail: str) -> None:
-    title = (title or "Error")[:140]
+    msg = f"{title}{f' - {detail}' if detail else ''}"
+    wa_logger.error(msg)
     if not frappe:
-        sys.stderr.write(f"[ERROR] {title}\n{detail}\n")
         return
     try:
         frappe.log_error(title, detail)
     except Exception:
-        sys.stderr.write(f"[FRAPPE LOG ERROR FAILED] {title}\n{detail}\n")
+        pass
 
 def _publish_qr_event(session_id: str, status: str, *, b64: Optional[str] = None, diag: Optional[str] = None) -> None:
     if not frappe:
