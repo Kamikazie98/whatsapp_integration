@@ -16,6 +16,18 @@ def _pick_connected_session():
 		for d in devices:
 			st = check_qr_status_pw(d.name) or {}
 			if st.get("status") == "connected":
+				if d.status != "Connected":
+					try:
+						frappe.db.set_value(
+							"WhatsApp Device",
+							d.name,
+							{
+								"status": "Connected",
+								"last_sync": frappe.utils.now(),
+							},
+						)
+					except Exception:
+						pass
 				return d.name
 	except Exception:
 		pass
