@@ -451,24 +451,29 @@ async def _snapshot_qr_once(page) -> Optional[str]:
 async def wait_for_qr(
     page,
     *,
-    timeout_ms: int = 90_000,
-    poll_ms: int = 1_250,
+    timeout_ms: int = 120_000,  # Increased timeout
+    poll_ms: int = 1_500,
     dump_dir: Union[str, Path] = DEFAULT_DUMP_DIR,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Find QR as data URL. On failure, save diagnostics and return (None, png_path)."""
+    _log_info(f"Starting to wait for QR code ({timeout_ms / 1000}s timeout)...")
     start = time.time()
     while (time.time() - start) * 1000 < timeout_ms:
         with contextlib.suppress(Exception):
             if await _is_logged_in(page):
+                _log_info("Detected logged-in state, attempting to log out to get QR screen.")
                 await _logout_if_needed(page)
 
-        for sel in QR_SELECTORS:
+        for i, sel in enumerate(QR_SELECTORS):
+            _log_info(f"  -> Trying QR selector #{i+1}: {sel}")
             data_url = await _try_extract_qr_dataurl(page, sel)
             if data_url:
+                _log_info("QR code found successfully.")
                 return data_url, None
 
         await asyncio.sleep(poll_ms / 1000.0)
 
+    _log_error("Timed out waiting for QR code.", f"Timeout was {timeout_ms / 1000}s.")
     # diagnostics
     diag_dir = Path(dump_dir); diag_dir.mkdir(parents=True, exist_ok=True)
     png_path = str(diag_dir / "whatsapp_qr_not_found.png")
@@ -484,8 +489,8 @@ async def generate_qr_base64(
     headless: bool = True,
     user_agent: Optional[str] = None,
     dump_dir: Union[str, Path] = DEFAULT_DUMP_DIR,
-    nav_timeout_ms: int = 120_000,
-    qr_timeout_ms: int = 90_000,
+    nav_timeout_ms: int = 150_000,  # Increased timeout
+    qr_timeout_ms: int = 120_000,
     proxy: Optional[dict] = None,
     extra_browser_args: Optional[list] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
