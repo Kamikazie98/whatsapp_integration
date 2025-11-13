@@ -5,43 +5,42 @@ def _digits_only(phone: str) -> str:
 	return re.sub(r"\D", "", phone or "")
 
 def _pick_connected_session():
-	"""Pick a usable session id from WhatsApp Device or Playwright status."""
-	connected = frappe.db.get_value("WhatsApp Device", {"status": "Connected"}, "name")
-	if connected:
-		return connected
+	"""Pick a usable session id (device number) from WhatsApp Device or Playwright status."""
+	# Prefer devices already marked as Connected in the DB
+	connected_device = frappe.db.get_value("WhatsApp Device", {"status": "Connected"}, ["name", "number"])
+	if connected_device:
+		return connected_device[1] or _digits_only(connected_device[0])
 
+	# Fallback: check live status via Playwright
 	try:
 		from whatsapp_integration.api.whatsapp_playwright import check_qr_status_pw
-		devices = frappe.get_all("WhatsApp Device", fields=["name", "status"], order_by="modified desc", limit=5)
+		devices = frappe.get_all("WhatsApp Device", fields=["name", "number", "status"], order_by="modified desc", limit=5)
 		for d in devices:
-			st = check_qr_status_pw(d.name) or {}
+			# Use number as session_id for PW checks
+			session_id_for_check = d.number or _digits_only(d.name)
+			if not session_id_for_check:
+				continue
+
+			st = check_qr_status_pw(session_id_for_check) or {}
 			if st.get("status") == "connected":
 				if d.status != "Connected":
-					try:
+					with contextlib.suppress(Exception):
 						frappe.db.set_value(
-							"WhatsApp Device",
-							d.name,
-							{
-								"status": "Connected",
-								"last_sync": frappe.utils.now(),
-							},
+							"WhatsApp Device", d.name, {"status": "Connected", "last_sync": frappe.utils.now()}
 						)
-					except Exception:
-						pass
-				return d.name
-	except Exception:
-		pass
+				return session_id_for_check # Return the number
+	except Exception as e:
+		frappe.log_error("WhatsApp Session Picker", f"Error checking live PW status: {e}")
 
-	any_dev = frappe.db.get_value("WhatsApp Device", {}, "name")
+	# Last resort
+	any_dev = frappe.db.get_value("WhatsApp Device", {}, "number")
 	return any_dev
 
 
 def send_unofficial(number, message):
-	"""Send message using Playwright (Unofficial WhatsApp Web).
-	- Prefer Playwright persistent profile
-	- Fallback to basic python sender
-	"""
+	"""Send message using Playwright (Unofficial WhatsApp Web)."""
 	try:
+		# Session ID is always the device's phone number
 		session_id = _pick_connected_session()
 		if not session_id:
 			raise Exception("No connected WhatsApp device. Please scan QR and connect a device first.")

@@ -3,26 +3,37 @@ from whatsapp_integration.api.whatsapp_official import send_official
 from whatsapp_integration.api.whatsapp_unofficial import send_unofficial
 
 @frappe.whitelist()
-def send_whatsapp_message(number, message):
+def send_whatsapp_message(number, message, device=None):
     """Unified entry point for sending WhatsApp messages"""
     settings = frappe.get_doc("WhatsApp Settings")
-    
+    device_name = device or settings.default_device
+
+    if not device_name:
+        frappe.throw("No device specified and no default device is set.")
+
     # Log the message attempt
     log_doc = frappe.get_doc({
         "doctype": "WhatsApp Message Log",
         "number": number,
         "message": message,
         "direction": "Out",
-        "status": "Sending"
+        "status": "Sending",
+        "device": device_name,
     })
     log_doc.insert(ignore_permissions=True)
-    
+
     try:
         if settings.mode == "Official":
             result = send_official(number, message)
         else:
-            result = send_unofficial(number, message)
-        
+            # Pre-send check for Unofficial mode
+            device_doc = frappe.get_doc("WhatsApp Device", device_name)
+            if device_doc.status != "Connected":
+                raise frappe.ValidationError(
+                    f"Device '{device_name}' is not connected. Current status: {device_doc.status}."
+                )
+            result = send_unofficial(device_name, number, message)
+
         log_doc.status = "Sent"
         log_doc.save(ignore_permissions=True)
         return result
