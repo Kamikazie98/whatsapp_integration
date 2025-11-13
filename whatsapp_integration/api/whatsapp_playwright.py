@@ -59,10 +59,10 @@ except Exception:
 WHATSAPP_WEB_URL = "https://web.whatsapp.com/"
 
 QR_SELECTORS = [
-    'div[data-testid="qrcode"] canvas',
-    'canvas[aria-label="Scan me!"]',
-    'img[alt="Scan me!"]',
-    'div[data-testid="qrcode"] img',
+    'div[class*="_akau"] canvas',          # Primary selector from user-provided HTML
+    'canvas[aria-label="Scan this QR code to link a device!"]', # New aria-label
+    'canvas[aria-label="Scan me!"]',      # Legacy
+    'div[data-testid="qrcode"] canvas',   # Legacy
 ]
 
 LOGIN_MARKERS = [
