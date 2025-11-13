@@ -48,6 +48,7 @@ class WhatsAppDevice(Document):
 
 			if isinstance(status_payload, dict):
 				state = status_payload.get("status")
+				error_details = status_payload.get("message") or status_payload.get("diag")
 				if state == "connected":
 					if self.status != "Connected":
 						self._update_fields({"status": "Connected"})
@@ -75,6 +76,12 @@ class WhatsAppDevice(Document):
 				if state in {"error", "not_found"} and self.status != "Connected":
 					if self.status != "Disconnected":
 						self._update_fields({"status": "Disconnected"})
+					return {
+						"status": state,
+						"message": error_details or f"Unable to connect device {self.number}",
+						"device_number": self.number,
+						"diag": status_payload.get("diag"),
+					}
 
 			if self.status == "Connected":
 				return {
@@ -97,10 +104,13 @@ class WhatsAppDevice(Document):
 				"device_number": self.number,
 			}
 		except Exception as exc:
-			frappe.log_error(f"Error checking connection status: {exc}", "WhatsApp Connection Status")
+			trace = frappe.get_traceback()
+			frappe.log_error(f"Error checking connection status: {exc}\n\n{trace}", "WhatsApp Connection Status")
 			return {
 				"status": "error",
 				"message": f"Failed to check connection status: {exc}",
+				"error_type": exc.__class__.__name__,
+				"traceback": trace,
 				"device_number": self.number,
 			}
 

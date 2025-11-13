@@ -339,16 +339,16 @@ async def _is_logged_in(page) -> bool:
 
 
 async def _wait_for_login(page, timeout_s: float = 15.0) -> bool:
-	deadline = time.time() + max(timeout_s, 1.0)
-	while time.time() < deadline:
-		if await _is_logged_in(page):
-			return True
-		with contextlib.suppress(Exception):
-			qr_visible = await page.locator('div[data-testid="qrcode"], canvas[aria-label="Scan me!"]').first.is_visible()
-			if qr_visible:
-				return False
-		await asyncio.sleep(0.5)
-	return await _is_logged_in(page)
+    deadline = time.time() + max(timeout_s, 1.0)
+    while time.time() < deadline:
+        if await _is_logged_in(page):
+            return True
+        with contextlib.suppress(Exception):
+            qr_visible = await page.locator('div[data-testid="qrcode"], canvas[aria-label="Scan me!"]').first.is_visible()
+            if qr_visible:
+                return False
+        await asyncio.sleep(0.5)
+    return await _is_logged_in(page)
 
 async def _logout_if_needed(page) -> None:
     """Clear storages to force QR screen."""

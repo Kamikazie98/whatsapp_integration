@@ -79,6 +79,9 @@ frappe.ui.form.on('WhatsApp Device', {
                             if (status.message) {
                                 message += `\n\n${status.message}`;
                             }
+							if (status.diag) {
+								message += `\n\nDiagnostics: ${status.diag}`;
+							}
                             if (status.last_sync) {
                                 message += `\nLast Sync: ${status.last_sync}`;
                             }
@@ -93,11 +96,14 @@ frappe.ui.form.on('WhatsApp Device', {
                         }
                     },
                     error: function(r) {
-                        frappe.msgprint({
-                            title: __('Connection Status Error'),
-                            message: 'Failed to check connection status. Please try again.',
-                            indicator: 'red'
-                        });
+						const data = (r && r.message) || r || {};
+						const detail = data.message || data.exc || __('Failed to check connection status. Please try again.');
+						const extra = data.traceback ? `\n\n${__("Traceback")}: ${data.traceback}` : '';
+						frappe.msgprint({
+							title: __('Connection Status Error'),
+							message: `${detail}${extra}`,
+							indicator: 'red'
+						});
                     }
                 });
             }, __('Actions'));
