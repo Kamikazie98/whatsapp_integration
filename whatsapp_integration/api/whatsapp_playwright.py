@@ -528,28 +528,28 @@ async def _send_message_pw_async(
         with contextlib.suppress(Exception):
             timestamp = frappe.utils.now()
 
-    async with async_playwright() as p:
-        # Prefer storage_state; if missing, fall back to persistent profile dir
-        if state_exists:
-            browser = await p.chromium.launch(headless=headless, args=chromium_args)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=DEFAULT_USER_AGENT,
-                java_script_enabled=True,
-                storage_state=str(state_path),
-            )
-        elif profile_path and profile_path.exists():
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(profile_path),
-                headless=headless,
-                args=chromium_args,
-                viewport={"width": 1280, "height": 900},
-                user_agent=DEFAULT_USER_AGENT,
-                java_script_enabled=True,
-            )
-            browser = None  # managed by context
-        else:
-            return {"success": False, "error": "Device is not connected (session profile missing)"}
+	async with async_playwright() as p:
+		# Prefer storage_state; if missing, fall back to persistent profile dir
+		if state_exists:
+			browser = await p.chromium.launch(headless=headless, args=chromium_args)
+			context = await browser.new_context(
+				viewport={"width": 1280, "height": 900},
+				user_agent=DEFAULT_USER_AGENT,
+				java_script_enabled=True,
+				storage_state=str(state_path),
+			)
+		elif profile_path and profile_path.exists():
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=str(profile_path),
+				headless=headless,
+				args=chromium_args,
+				viewport={"width": 1280, "height": 900},
+				user_agent=DEFAULT_USER_AGENT,
+				java_script_enabled=True,
+			)
+			browser = None  # managed by context
+		else:
+			return {"success": False, "error": "Device is not connected (session profile missing)"}
 		page = await context.new_page()
 		try:
 			await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
@@ -557,34 +557,34 @@ async def _send_message_pw_async(
 				return {"success": False, "error": "WhatsApp session not authenticated"}
 			with contextlib.suppress(Exception):
 				await _persist_storage_state(context, session_id, dump_dir)
-            send_selectors = [
-                "[data-testid='send']",
-                "button[aria-label='Send']",
-                "[data-testid='compose-btn-send']",
-            ]
-            for sel in send_selectors:
-                try:
-                    btn = page.locator(sel).first
-                    await btn.wait_for(state="visible", timeout=timeout_s * 1000)
-                    await btn.click()
-                    break
-                except Exception:
-                    continue
-            else:
-                return {"success": False, "error": "Send button not found"}
-            await page.wait_for_timeout(1500)
-            if not timestamp:
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-            return {
-                "success": True,
-                "message_id": f"{session_id}_{dest}_{int(time.time())}",
-                "timestamp": timestamp,
-            }
-        finally:
-            with contextlib.suppress(Exception): await page.close()
-            with contextlib.suppress(Exception): await context.close()
-            if 'browser' in locals() and browser:
-                with contextlib.suppress(Exception): await browser.close()
+			send_selectors = [
+				"[data-testid='send']",
+				"button[aria-label='Send']",
+				"[data-testid='compose-btn-send']",
+			]
+			for sel in send_selectors:
+				try:
+					btn = page.locator(sel).first
+					await btn.wait_for(state="visible", timeout=timeout_s * 1000)
+					await btn.click()
+					break
+				except Exception:
+					continue
+			else:
+				return {"success": False, "error": "Send button not found"}
+			await page.wait_for_timeout(1500)
+			if not timestamp:
+				timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+			return {
+				"success": True,
+				"message_id": f"{session_id}_{dest}_{int(time.time())}",
+				"timestamp": timestamp,
+			}
+		finally:
+			with contextlib.suppress(Exception): await page.close()
+			with contextlib.suppress(Exception): await context.close()
+			if "browser" in locals() and browser:
+				with contextlib.suppress(Exception): await browser.close()
 
 
 def send_message_pw(
