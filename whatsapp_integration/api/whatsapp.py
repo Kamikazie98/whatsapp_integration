@@ -1,16 +1,6 @@
 import frappe
-import traceback
 from whatsapp_integration.api.whatsapp_official import send_official
 from whatsapp_integration.api.whatsapp_unofficial import send_unofficial
-
-def _log_traceback():
-    """Logs the current exception's traceback to the dedicated log file."""
-    try:
-        from whatsapp_integration.api.whatsapp_playwright import wa_logger
-        wa_logger.error(f"WhatsApp Send Traceback:\n{traceback.format_exc()}")
-    except Exception:
-        # Fallback if logger itself fails
-        pass
 
 @frappe.whitelist()
 def send_whatsapp_message(number, message, device=None):
@@ -52,5 +42,5 @@ def send_whatsapp_message(number, message, device=None):
         log_doc.status = "Failed"
         log_doc.error_message = str(e)
         log_doc.save(ignore_permissions=True)
-        _log_traceback() # Log the full traceback to our file
+        # The main frappe logger will still capture this traceback
         raise e

@@ -894,6 +894,12 @@ async def _pw_monitor_async(
             _active_pw_profiles.pop(session_id, None)
 
 # --------------- Frappe integration ---------------
+import traceback
+
+def _log_traceback(context: str):
+    """Logs the current exception's traceback to the dedicated log file."""
+    wa_logger.error(f"Traceback ({context}):\n{traceback.format_exc()}")
+
 def _run_async(coro):
     try:
         asyncio.get_running_loop()
