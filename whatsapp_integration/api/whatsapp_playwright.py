@@ -95,6 +95,12 @@ _active_pw_profiles: dict[str, Path] = {}
 _session_dump_dirs: dict[str, Path] = {}
 _session_user_hints: dict[str, Optional[str]] = {}
 _session_storage_files: dict[str, Path] = {}
+
+# --- New Command Queue Architecture ---
+_session_command_queues: dict[str, list[dict]] = {}
+_session_command_results: dict[str, dict] = {}
+# --- End New Architecture ---
+
 _pw_lock = threading.Lock()
 
 
@@ -524,124 +530,46 @@ async def generate_qr_base64(
             with contextlib.suppress(Exception): await browser.close()
 
 
-async def _send_message_pw_async(
-    *,
-    session_id: str,
-    phone_number: str,
-    message: str,
-    dump_dir: Union[str, Path],
-    headless: bool,
-    timeout_s: int,
-) -> dict:
-    """Send a WhatsApp message using the saved Playwright storage state."""
-    from playwright.async_api import async_playwright
-
+async def _send_message_pw_async(*, page, phone_number: str, message: str, timeout_s: int = 30) -> dict:
+    """Send a WhatsApp message using an existing, connected Playwright page."""
     dest = _digits_only(phone_number)
     if not dest:
         return {"success": False, "error": "Invalid destination number"}
 
-    dump_dir = Path(dump_dir)
-    with _pw_lock:
-        state_path = _session_storage_files.get(session_id)
-        profile_dir = _active_pw_profiles.get(session_id)
-    if not state_path:
-        state_path = _storage_state_path(session_id, dump_dir)
-    state_exists = Path(state_path).exists()
-    profile_path: Optional[Path] = None
-    if profile_dir:
-        profile_path = Path(profile_dir)
-    else:
-        # derive profile path from dump_dir even across process restarts
-        derived = _profile_dir_path(session_id, dump_dir)
-        if derived.exists():
-            profile_path = derived
+    chat_url = f"{WHATSAPP_WEB_URL}send?phone={dest}&text={urllib.parse.quote(message or '', safe='')}"
+    timestamp = frappe.utils.now() if frappe else time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-    if not state_exists and not (profile_path and profile_path.exists()):
-        _log_error(
-            f"Cannot send message for '{session_id}': session not connected.",
-            f"State file: {state_path} (exists={state_exists}); Profile: {profile_path}",
-        )
-        return {"success": False, "error": "Device is not connected (session profile missing)"}
+    try:
+        await page.goto(chat_url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
 
-    _log_info(f"Attempting to send message via session '{session_id}'", f"To: {phone_number}")
-    chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
-    chat_url = (
-        f"{WHATSAPP_WEB_URL}send?"
-        f"phone={dest}&text={urllib.parse.quote(message or '', safe='')}"
-    )
-    timestamp = None
-    if frappe:
-        with contextlib.suppress(Exception):
-            timestamp = frappe.utils.now()
+        send_selectors = [
+            "button[aria-label*='Send']",
+            "span[data-icon='send']",
+            "button[data-testid='compose-btn-send']",
+        ]
 
-    async with async_playwright() as p:
-        # Prefer storage_state; if missing, fall back to persistent profile dir
-        if state_exists:
-            browser = await p.chromium.launch(headless=headless, args=chromium_args)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=DEFAULT_USER_AGENT,
-                java_script_enabled=True,
-                storage_state=str(state_path),
-            )
-        elif profile_path and profile_path.exists():
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(profile_path),
-                headless=headless,
-                args=chromium_args,
-                viewport={"width": 1280, "height": 900},
-                user_agent=DEFAULT_USER_AGENT,
-                java_script_enabled=True,
-            )
-            browser = None  # managed by context
-        else:
-            return {"success": False, "error": "Device is not connected (session profile missing)"}
+        for sel in send_selectors:
+            try:
+                btn = page.locator(sel).first
+                # Use a shorter timeout per selector
+                await btn.wait_for(state="visible", timeout=10_000)
+                await btn.click(timeout=5_000)
+                await page.wait_for_timeout(1500) # Wait for message to appear sent
+                return {
+                    "success": True,
+                    "message_id": f"{dest}_{int(time.time())}",
+                    "timestamp": timestamp,
+                }
+            except Exception:
+                continue
 
-        page = await context.new_page()
-        try:
-            await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
-            if not await _wait_for_login(page, timeout_s=max(timeout_s, 10)):
-                return {"success": False, "error": "WhatsApp session not authenticated"}
-            with contextlib.suppress(Exception):
-                await _persist_storage_state(context, session_id, dump_dir)
+        _log_error(f"Failed to send message to {dest}", "All send selectors failed.")
+        return {"success": False, "error": "Send button not found"}
 
-            send_selectors = [
-                "button[aria-label*='Send']",          # Covers "Send" and "Send message"
-                "span[data-icon='send']",              # Icon-based selector
-                "button[data-testid='compose-btn-send']", # Test ID
-            ]
-            _log_info(f"Attempting to find send button for session '{session_id}'...")
-            for i, sel in enumerate(send_selectors):
-                try:
-                    _log_info(f"  -> Trying send selector #{i+1}: {sel}")
-                    btn = page.locator(sel).first
-                    await btn.wait_for(state="visible", timeout=(timeout_s * 1000) // len(send_selectors))
-                    await btn.click()
-                    _log_info("Send button clicked successfully.")
-                    break
-                except Exception as exc:
-                    _log_info(f"Selector failed: {exc.__class__.__name__}")
-                    continue
-            else:
-                _log_error(f"Failed to find send button for session '{session_id}'", "All selectors failed.")
-                return {"success": False, "error": "Send button not found"}
-
-            await page.wait_for_timeout(2000)
-            if not timestamp:
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-            return {
-                "success": True,
-                "message_id": f"{session_id}_{dest}_{int(time.time())}",
-                "timestamp": timestamp,
-            }
-        finally:
-            with contextlib.suppress(Exception):
-                await page.close()
-            with contextlib.suppress(Exception):
-                await context.close()
-            if "browser" in locals() and browser:
-                with contextlib.suppress(Exception):
-                    await browser.close()
+    except Exception as e:
+        _log_error(f"Error during message sending to {dest}", f"{e.__class__.__name__}: {e}")
+        _log_traceback("send_message_pw")
+        return {"success": False, "error": str(e)}
 
 
 def send_message_pw(
@@ -832,31 +760,47 @@ async def _pw_monitor_async(
             connected = False
 
             while not stop_event.is_set():
+                # --- State: Connected ---
                 if await _is_logged_in(page):
                     if not connected:
                         _log_info(f"Session '{session_id}' is now connected.")
                         connected = True
                         await _persist_storage_state(context, session_id, dump_dir)
-                        _store_status(
-                            session_id,
-                            "connected",
-                            message="Successfully connected to WhatsApp",
-                            publish=True,
-                        )
-                    # Keep session alive and reset monitor deadline
-                    monitor_deadline = time.time() + QR_MONITOR_SECS
-                    await asyncio.sleep(15)  # Check login status every 15s
+                        _store_status(session_id, "connected", message="Connected", publish=True)
+
+                    # Process command queue
+                    commands_to_run = []
+                    with _pw_lock:
+                        if session_id in _session_command_queues:
+                            commands_to_run = _session_command_queues.pop(session_id, [])
+
+                    for cmd in commands_to_run:
+                        cmd_id = cmd.get("id")
+                        _log_info(f"Executing command '{cmd.get('type')}' with ID '{cmd_id}'")
+                        result = {}
+                        if cmd.get("type") == "send_message":
+                            result = await _send_message_pw_async(
+                                page=page, # Use existing page
+                                phone_number=cmd.get("phone_number"),
+                                message=cmd.get("message"),
+                            )
+
+                        if cmd_id:
+                            with _pw_lock:
+                                _session_command_results[cmd_id] = result
+
+                    await asyncio.sleep(0.5) # Poll queue frequently when connected
                     continue
 
-                # If we reach here, we are not logged in
+                # --- State: Disconnected ---
                 if connected:
-                    _log_error(f"Session '{session_id}' lost connection.", "Attempting to get a new QR code.")
+                    _log_error(f"Session '{session_id}' lost connection.", "Attempting to get new QR.")
                     connected = False
                     monitor_deadline = time.time() + QR_MONITOR_SECS
                     await _logout_if_needed(page)
 
                 if time.time() > monitor_deadline:
-                    _log_error(f"QR monitoring for '{session_id}' timed out.", "Thread will now exit.")
+                    _log_error(f"QR monitoring for '{session_id}' timed out.", "Exiting.")
                     break
 
                 fresh_qr = await _snapshot_qr_once(page)

@@ -5,33 +5,48 @@ def _digits_only(phone: str) -> str:
 	return re.sub(r"\D", "", phone or "")
 
 def send_unofficial(device_name, number, message):
-	"""Send message using Playwright (Unofficial WhatsApp Web)."""
+	"""Enqueue a 'send_message' command for the active Playwright service."""
 	try:
-		device_doc = frappe.get_doc("WhatsApp Device", device_name)
-		session_id = device_doc.number # Session ID is always the phone number
+		from whatsapp_integration.api.whatsapp_playwright import (
+			_session_command_queues,
+			_session_command_results,
+			_pw_lock,
+		)
 
+		device_doc = frappe.get_doc("WhatsApp Device", device_name)
+		session_id = device_doc.number
 		if not session_id:
 			raise Exception(f"Device '{device_name}' does not have a number set.")
 
-		dest = _digits_only(number)
-		if not dest:
-			raise Exception("Invalid destination number")
+		cmd_id = f"send_{session_id}_{frappe.generate_hash(length=8)}"
+		command = {
+			"id": cmd_id,
+			"type": "send_message",
+			"phone_number": number,
+			"message": message,
+		}
 
-		# 1) Playwright first
-		try:
-			from whatsapp_integration.api.whatsapp_playwright import send_message_pw
-			result = send_message_pw(session_id, dest, message)
-			if isinstance(result, dict) and result.get("success"):
-				return result
-		except Exception as pw_err:
-			frappe.log_error("WhatsApp Unofficial Send", f"PW send failed: {pw_err}")
+		with _pw_lock:
+			_session_command_queues.setdefault(session_id, []).append(command)
 
-		# 2) Simple fallback
-		from whatsapp_integration.api.whatsapp_python import send_message
-		result = send_message(session_id, dest, message)
-		if result.get("success"):
-			return result
-		raise Exception(result.get("error", "Failed to send message"))
+		# Wait for the result
+		timeout = 30  # seconds
+		deadline = frappe.utils.now_datetime() + frappe.utils.timedelta(seconds=timeout)
+		result = None
+		while frappe.utils.now_datetime() < deadline:
+			with _pw_lock:
+				if cmd_id in _session_command_results:
+					result = _session_command_results.pop(cmd_id)
+					break
+			frappe.sleep(0.5)
+
+		if result is None:
+			raise Exception("Request timed out. The WhatsApp service may be disconnected or busy.")
+
+		if not result.get("success"):
+			raise Exception(result.get("error", "Failed to send message via active session"))
+
+		return result
 
 	except Exception as e:
 		message = f"Failed to send message: {str(e)}"
