@@ -550,11 +550,11 @@ async def _send_message_pw_async(
             browser = None  # managed by context
         else:
             return {"success": False, "error": "Device is not connected (session profile missing)"}
-        page = await context.new_page()
-        try:
-            await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
+		page = await context.new_page()
+		try:
+			await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
 			if not await _wait_for_login(page, timeout_s=max(timeout_s, 10)):
-                return {"success": False, "error": "WhatsApp session not authenticated"}
+				return {"success": False, "error": "WhatsApp session not authenticated"}
 			with contextlib.suppress(Exception):
 				await _persist_storage_state(context, session_id, dump_dir)
             send_selectors = [
