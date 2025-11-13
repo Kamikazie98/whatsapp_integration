@@ -31,7 +31,7 @@ def send_unofficial(device_name, number, message):
 
 		# Wait for the result
 		timeout = 30  # seconds
-		deadline = frappe.utils.now_datetime() + frappe.utils.timedelta(seconds=timeout)
+		deadline = frappe.utils.now_datetime() + frappe.utils.datetime.timedelta(seconds=timeout)
 		result = None
 		while frappe.utils.now_datetime() < deadline:
 			with _pw_lock:
