@@ -66,15 +66,14 @@ QR_SELECTORS = [
 ]
 
 LOGIN_MARKERS = [
+    '[data-testid="side"]', # The main side panel
+    'div[title="New chat"]', # New chat button
     'div[data-testid="chat-list-search"]',
     'div[aria-label="Chat list"]',
     'header[data-testid="chatlist-header"]',
     'div[data-testid="chat-list"]',
     'div[data-testid="conversation-panel-wrapper"]',
-    'div[data-testid="conversation-panel-messages"]',
     'div[data-testid="conversation-panel"]',
-    '[data-testid="conversation-panel-body"]',
-    'div[data-testid="chat"]',
 ]
 
 DEFAULT_USER_AGENT = (
@@ -758,38 +757,35 @@ async def _pw_monitor_async(
             monitor_deadline = time.time() + QR_MONITOR_SECS
             misses = 0
             connected = False
+            post_scan_diag_captured = False # Debug flag
 
             while not stop_event.is_set():
                 # --- State: Connected ---
                 if await _is_logged_in(page):
                     if not connected:
-                        _log_info(f"Session '{session_id}' is now connected.")
+                        _log_info(f"Session '{session_id}' is now connected (login markers found).")
                         connected = True
+                        post_scan_diag_captured = True # Diags not needed if we connect
                         await _persist_storage_state(context, session_id, dump_dir)
                         _store_status(session_id, "connected", message="Connected", publish=True)
 
-                    # Process command queue
+                    # Process command queue...
+                    # (The existing logic for command processing remains here)
                     commands_to_run = []
                     with _pw_lock:
                         if session_id in _session_command_queues:
                             commands_to_run = _session_command_queues.pop(session_id, [])
-
                     for cmd in commands_to_run:
                         cmd_id = cmd.get("id")
                         _log_info(f"Executing command '{cmd.get('type')}' with ID '{cmd_id}'")
                         result = {}
                         if cmd.get("type") == "send_message":
-                            result = await _send_message_pw_async(
-                                page=page, # Use existing page
-                                phone_number=cmd.get("phone_number"),
-                                message=cmd.get("message"),
-                            )
-
+                            result = await _send_message_pw_async(page=page, phone_number=cmd.get("phone_number"), message=cmd.get("message"))
                         if cmd_id:
                             with _pw_lock:
                                 _session_command_results[cmd_id] = result
 
-                    await asyncio.sleep(0.5) # Poll queue frequently when connected
+                    await asyncio.sleep(0.5)
                     continue
 
                 # --- State: Disconnected ---
@@ -810,16 +806,28 @@ async def _pw_monitor_async(
                     if fresh_hash and fresh_hash != last_hash:
                         last_hash = fresh_hash
                         monitor_deadline = time.time() + QR_MONITOR_SECS
-                        _store_status(
-                            session_id,
-                            "qr_generated",
-                            qr=fresh_qr,
-                            message="QR refreshed",
-                            publish=True,
-                        )
+                        _store_status(session_id, "qr_generated", qr=fresh_qr, message="QR refreshed", publish=True)
                 else:
+                    # --- ADVANCED DEBUGGING: QR has disappeared ---
+                    if not post_scan_diag_captured and last_hash:
+                        _log_info("QR not visible, assuming scan happened. Capturing post-login diagnostics...")
+                        await asyncio.sleep(7) # Wait for chat interface to load
+
+                        diag_dir = Path(dump_dir); diag_dir.mkdir(parents=True, exist_ok=True)
+
+                        ss_path = diag_dir / "post_login_screenshot.png"
+                        await page.screenshot(path=str(ss_path), full_page=True)
+                        _log_info(f"Saved post-login screenshot to {ss_path}")
+
+                        html_path = diag_dir / "post_login_page.html"
+                        html_content = await page.content()
+                        await _safe_write_text(html_path, html_content)
+                        _log_info(f"Saved post-login HTML to {html_path}")
+
+                        post_scan_diag_captured = True # Only capture once
+
                     misses += 1
-                    if misses >= 5:
+                    if misses >= 10: # Increased threshold
                         with contextlib.suppress(Exception):
                             await _logout_if_needed(page)
                         misses = 0
