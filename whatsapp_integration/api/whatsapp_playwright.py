@@ -337,6 +337,19 @@ async def _is_logged_in(page) -> bool:
             return True
     return False
 
+
+async def _wait_for_login(page, timeout_s: float = 15.0) -> bool:
+	deadline = time.time() + max(timeout_s, 1.0)
+	while time.time() < deadline:
+		if await _is_logged_in(page):
+			return True
+		with contextlib.suppress(Exception):
+			qr_visible = await page.locator('div[data-testid="qrcode"], canvas[aria-label="Scan me!"]').first.is_visible()
+			if qr_visible:
+				return False
+		await asyncio.sleep(0.5)
+	return await _is_logged_in(page)
+
 async def _logout_if_needed(page) -> None:
     """Clear storages to force QR screen."""
     await page.context.clear_cookies()
@@ -540,8 +553,10 @@ async def _send_message_pw_async(
         page = await context.new_page()
         try:
             await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
-            if not await _is_logged_in(page):
+			if not await _wait_for_login(page, timeout_s=max(timeout_s, 10)):
                 return {"success": False, "error": "WhatsApp session not authenticated"}
+			with contextlib.suppress(Exception):
+				await _persist_storage_state(context, session_id, dump_dir)
             send_selectors = [
                 "[data-testid='send']",
                 "button[aria-label='Send']",
