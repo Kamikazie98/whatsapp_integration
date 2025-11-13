@@ -4,46 +4,14 @@ import frappe
 def _digits_only(phone: str) -> str:
 	return re.sub(r"\D", "", phone or "")
 
-def _pick_connected_session():
-	"""Pick a usable session id (device number) from WhatsApp Device or Playwright status."""
-	# Prefer devices already marked as Connected in the DB
-	connected_device = frappe.db.get_value("WhatsApp Device", {"status": "Connected"}, ["name", "number"])
-	if connected_device:
-		return connected_device[1] or _digits_only(connected_device[0])
-
-	# Fallback: check live status via Playwright
-	try:
-		from whatsapp_integration.api.whatsapp_playwright import check_qr_status_pw
-		devices = frappe.get_all("WhatsApp Device", fields=["name", "number", "status"], order_by="modified desc", limit=5)
-		for d in devices:
-			# Use number as session_id for PW checks
-			session_id_for_check = d.number or _digits_only(d.name)
-			if not session_id_for_check:
-				continue
-
-			st = check_qr_status_pw(session_id_for_check) or {}
-			if st.get("status") == "connected":
-				if d.status != "Connected":
-					with contextlib.suppress(Exception):
-						frappe.db.set_value(
-							"WhatsApp Device", d.name, {"status": "Connected", "last_sync": frappe.utils.now()}
-						)
-				return session_id_for_check # Return the number
-	except Exception as e:
-		frappe.log_error("WhatsApp Session Picker", f"Error checking live PW status: {e}")
-
-	# Last resort
-	any_dev = frappe.db.get_value("WhatsApp Device", {}, "number")
-	return any_dev
-
-
-def send_unofficial(number, message):
+def send_unofficial(device_name, number, message):
 	"""Send message using Playwright (Unofficial WhatsApp Web)."""
 	try:
-		# Session ID is always the device's phone number
-		session_id = _pick_connected_session()
+		device_doc = frappe.get_doc("WhatsApp Device", device_name)
+		session_id = device_doc.number # Session ID is always the phone number
+
 		if not session_id:
-			raise Exception("No connected WhatsApp device. Please scan QR and connect a device first.")
+			raise Exception(f"Device '{device_name}' does not have a number set.")
 
 		dest = _digits_only(number)
 		if not dest:
