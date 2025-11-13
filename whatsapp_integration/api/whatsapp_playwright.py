@@ -43,7 +43,6 @@ WHATSAPP_WEB_URL = "https://web.whatsapp.com/"
 QR_SELECTORS = [
     'div[data-testid="qrcode"] canvas',
     'canvas[aria-label="Scan me!"]',
-    'div[data-ref] canvas',               # older builds
     'img[alt="Scan me!"]',
     'div[data-testid="qrcode"] img',
 ]
@@ -228,13 +227,19 @@ def _sync_device_doc(session_id: str, payload: dict) -> None:
 
 async def _persist_storage_state(context, session_id: str, dump_dir: Union[str, Path]) -> Optional[Path]:
     """Persist current storage so other Playwright sessions can reuse the login."""
+    target = None
     try:
         target = _storage_state_path(session_id, dump_dir, ensure_parent=True)
         await context.storage_state(path=str(target))
         with _pw_lock:
             _session_storage_files[session_id] = target
+        _log_info(f"Session state for '{session_id}' persisted successfully.", f"Path: {target}")
         return target
-    except Exception:
+    except Exception as exc:
+        _log_error(
+            f"Failed to persist session state for '{session_id}'",
+            f"Path: {target if target else 'unknown'}\n{exc}",
+        )
         return None
 
 
@@ -246,10 +251,15 @@ def _profile_dir_path(session_id: str, dump_dir: Union[str, Path]) -> Path:
 
 def _session_profile_dir(session_id: str, dump_dir: Union[str, Path]) -> Path:
     """Return a stable Chrome profile directory per logical session."""
-    profile = _profile_dir_path(session_id, dump_dir)
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    profile.mkdir(parents=True, exist_ok=True)
-    return profile
+    profile = None
+    try:
+        profile = _profile_dir_path(session_id, dump_dir)
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.mkdir(parents=True, exist_ok=True)
+        return profile
+    except Exception as exc:
+        _log_error(f"Failed to create profile dir for session '{session_id}'", f"Path: {profile}\n{exc}")
+        raise
 
 
 def _storage_state_path(
@@ -258,11 +268,16 @@ def _storage_state_path(
     *,
     ensure_parent: bool = False,
 ) -> Path:
-    base = Path(dump_dir) / "storage_states"
-    if ensure_parent:
-        base.mkdir(parents=True, exist_ok=True)
-    safe = session_id.replace("/", "_").replace("\\", "_")
-    return base / f"{safe}.json"
+    base = None
+    try:
+        base = Path(dump_dir) / "storage_states"
+        if ensure_parent:
+            base.mkdir(parents=True, exist_ok=True)
+        safe = session_id.replace("/", "_").replace("\\", "_")
+        return base / f"{safe}.json"
+    except Exception as exc:
+        _log_error(f"Failed to create storage state path for session '{session_id}'", f"Base: {base}\n{exc}")
+        raise
 
 
 def _digits_only(phone: Optional[str]) -> str:
@@ -518,6 +533,14 @@ async def _send_message_pw_async(
         if derived.exists():
             profile_path = derived
 
+    if not state_exists and not (profile_path and profile_path.exists()):
+        _log_error(
+            f"Cannot send message for '{session_id}': session not connected.",
+            f"State file: {state_path} (exists={state_exists}); Profile: {profile_path}",
+        )
+        return {"success": False, "error": "Device is not connected (session profile missing)"}
+
+    _log_info(f"Attempting to send message via session '{session_id}'", f"To: {phone_number}")
     chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
     chat_url = (
         f"{WHATSAPP_WEB_URL}send?"
@@ -636,8 +659,10 @@ def _ensure_pw_monitor(
     with _pw_lock:
         thread = _active_pw_threads.get(session_id)
         if thread and thread.is_alive():
+            _log_info(f"PW monitor for '{session_id}' is already running.")
             return
 
+        _log_info(f"Starting new PW monitor for '{session_id}'...")
         dump_path = Path(dump_dir)
         dump_path.mkdir(parents=True, exist_ok=True)
         _session_dump_dirs[session_id] = dump_path
@@ -669,33 +694,59 @@ def _pw_monitor_entry(
     site: Optional[str] = None,
     profile_dir: Optional[str] = None,
 ) -> None:
-    ctx_initialized = False
-    if frappe and site:
+    """Thread entrypoint. Manages Frappe context and retry loop for the async monitor."""
+    max_retries = 5
+    base_wait = 2.0  # seconds
+
+    for i in range(max_retries):
+        if stop_event.is_set():
+            _log_info(f"Stopping PW monitor for '{session_id}' by request.")
+            break
+
+        ctx_initialized = False
         try:
-            frappe.init(site=site)
-            ctx_initialized = True
-            frappe.connect()
-        except Exception as exc:
-            sys.stderr.write(f"[PW Monitor] Failed to init frappe site '{site}': {exc}\n")
-    try:
-        asyncio.run(
-            _pw_monitor_async(
-                session_id=session_id,
-                stop_event=stop_event,
-                headless=headless,
-                dump_dir=dump_dir,
-                qr_timeout_ms=qr_timeout_ms,
-                profile_dir=profile_dir,
+            if frappe and site:
+                try:
+                    frappe.init(site=site)
+                    ctx_initialized = True
+                    frappe.connect()
+                except Exception as exc:
+                    sys.stderr.write(f"[PW Monitor] Failed to init frappe site '{site}': {exc}\n")
+
+            _log_info(f"Starting PW monitor attempt #{i + 1} for '{session_id}'.")
+            asyncio.run(
+                _pw_monitor_async(
+                    session_id=session_id,
+                    stop_event=stop_event,
+                    headless=headless,
+                    dump_dir=dump_dir,
+                    qr_timeout_ms=qr_timeout_ms,
+                    profile_dir=profile_dir,
+                )
             )
-        )
-    finally:
-        if ctx_initialized and frappe:
-            with contextlib.suppress(Exception):
-                frappe.destroy()
-        with _pw_lock:
-            _active_pw_threads.pop(session_id, None)
-            _active_pw_stop.pop(session_id, None)
-            _session_user_hints.pop(session_id, None)
+            _log_info(f"PW monitor for '{session_id}' completed its run.")
+            break  # success, no retry needed
+
+        except Exception as exc:
+            _log_error(f"Playwright monitor for '{session_id}' crashed", f"{exc}")
+            if i < max_retries - 1 and not stop_event.is_set():
+                wait_time = base_wait * (2**i)
+                _log_info(f"Retrying PW monitor for '{session_id}' in {wait_time:.1f}s...")
+                stop_event.wait(wait_time)
+            else:
+                _log_error(f"PW monitor for '{session_id}' failed after max retries.", "Giving up.")
+                _store_status(session_id, "error", message="Monitor crashed permanently", publish=True)
+                break
+        finally:
+            if ctx_initialized and frappe:
+                with contextlib.suppress(Exception):
+                    frappe.destroy()
+
+    with _pw_lock:
+        _log_info(f"Cleaning up PW monitor thread references for '{session_id}'.")
+        _active_pw_threads.pop(session_id, None)
+        _active_pw_stop.pop(session_id, None)
+        _session_user_hints.pop(session_id, None)
 
 
 async def _pw_monitor_async(
@@ -824,6 +875,18 @@ def _run_async(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+def _log_info(title: str, detail: str | None = None) -> None:
+    title = (title or "Info")[:140]
+    if not frappe:
+        sys.stdout.write(f"[INFO] {title}\n{detail or ''}\n")
+        return
+    try:
+        frappe.logger("whatsapp").info(title, detail)
+    except Exception:
+        sys.stdout.write(f"[FRAPPE LOG INFO FAILED] {title}\n{detail or ''}\n")
+
 
 def _log_error(title: str, detail: str) -> None:
     title = (title or "Error")[:140]
