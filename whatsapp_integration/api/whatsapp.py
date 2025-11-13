@@ -10,7 +10,10 @@ def send_whatsapp_message(number, message, device=None):
     device_name = device or getattr(settings, "default_device", None)
 
     if not device_name:
-        frappe.throw("No device specified and no default device is set.")
+        # If no device is specified, automatically find one that is connected
+        device_name = frappe.db.get_value("WhatsApp Device", {"status": "Connected"}, "name")
+        if not device_name:
+            frappe.throw("No device specified and no connected WhatsApp device found.")
 
     # Log the message attempt
     log_doc = frappe.get_doc({
