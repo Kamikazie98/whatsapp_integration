@@ -751,25 +751,29 @@ async def _pw_monitor_async(
             monitor_deadline = time.time() + QR_MONITOR_SECS
             misses = 0
             connected = False
-            post_scan_diag_captured = False # Debug flag
+            post_scan_diag_captured = False
+            disconnect_checks = 0
+            DISCONNECT_THRESHOLD = 3 # Require 3 failed checks before disconnecting
 
             while not stop_event.is_set():
-                # --- State: Connected ---
-                if await _is_logged_in(page):
+                is_logged_in_now = await _is_logged_in(page)
+
+                if is_logged_in_now:
+                    disconnect_checks = 0  # Reset counter on any successful check
                     if not connected:
                         _log_info(f"Session '{session_id}' is now connected (login markers found).")
                         connected = True
-                        post_scan_diag_captured = True # Diags not needed if we connect
+                        post_scan_diag_captured = True
                         await _persist_storage_state(context, session_id, dump_dir)
                         _store_status(session_id, "connected", message="Connected", publish=True)
 
                     # Process command queue...
-                    # (The existing logic for command processing remains here)
                     commands_to_run = []
                     with _pw_lock:
                         if session_id in _session_command_queues:
                             commands_to_run = _session_command_queues.pop(session_id, [])
                     for cmd in commands_to_run:
+                        # ... (command execution logic remains the same)
                         cmd_id = cmd.get("id")
                         _log_info(f"Executing command '{cmd.get('type')}' with ID '{cmd_id}'")
                         result = {}
@@ -779,16 +783,25 @@ async def _pw_monitor_async(
                             with _pw_lock:
                                 _session_command_results[cmd_id] = result
 
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(2) # Poll for commands/status every 2s
                     continue
 
-                # --- State: Disconnected ---
-                if connected:
-                    _log_error(f"Session '{session_id}' lost connection.", "Attempting to get new QR.")
-                    connected = False
-                    monitor_deadline = time.time() + QR_MONITOR_SECS
-                    await _logout_if_needed(page)
+                # --- We are NOT logged in at this moment ---
 
+                if connected:
+                    # We *were* connected, but the check just failed. Start grace period.
+                    disconnect_checks += 1
+                    _log_info(f"Login check failed. Disconnect counter: {disconnect_checks}/{DISCONNECT_THRESHOLD}")
+                    if disconnect_checks >= DISCONNECT_THRESHOLD:
+                        _log_error(f"Session '{session_id}' lost connection after {DISCONNECT_THRESHOLD} failed checks.", "Forcing new QR code.")
+                        connected = False
+                        monitor_deadline = time.time() + QR_MONITOR_SECS
+                        await _logout_if_needed(page)
+
+                    await asyncio.sleep(2) # Wait 2s before next check
+                    continue
+
+                # --- We are fully disconnected, waiting for QR ---
                 if time.time() > monitor_deadline:
                     _log_error(f"QR monitoring for '{session_id}' timed out.", "Exiting.")
                     break

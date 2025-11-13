@@ -18,13 +18,14 @@ class WhatsAppDevice(Document):
 		try:
 			from whatsapp_integration.api.whatsapp_simple import set_session_connected
 			result = set_session_connected(self.number)
+			frappe.logger("whatsapp").info(f"Result from set_session_connected for '{self.name}': {result}")
 			if result.get("success"):
 				self._update_fields({"status": "Connected", "last_sync": frappe.utils.now()})
 				frappe.logger("whatsapp").info(f"Successfully marked device '{self.name}' as Connected.")
 				return {"success": True, "message": "Device marked as connected"}
 
-			frappe.logger("whatsapp").error(f"Failed to mark device '{self.name}' as Connected via simple API.")
-			return {"success": False, "message": "Failed to mark device as connected"}
+			frappe.logger("whatsapp").error(f"Failed to mark device '{self.name}' as Connected via simple API. Reason: {result.get('message')}")
+			return {"success": False, "message": f"Failed to mark as connected: {result.get('message')}"}
 		except Exception as exc:
 			frappe.log_error(f"Mark Connected Error: {exc}", "WhatsApp Mark Connected")
 			return {"success": False, "message": f"Error: {exc}"}
