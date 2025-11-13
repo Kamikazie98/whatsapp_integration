@@ -52,6 +52,12 @@ LOGIN_MARKERS = [
     'div[data-testid="chat-list-search"]',
     'div[aria-label="Chat list"]',
     'header[data-testid="chatlist-header"]',
+    'div[data-testid="chat-list"]',
+    'div[data-testid="conversation-panel-wrapper"]',
+    'div[data-testid="conversation-panel-messages"]',
+    'div[data-testid="conversation-panel"]',
+    '[data-testid="conversation-panel-body"]',
+    'div[data-testid="chat"]',
 ]
 
 DEFAULT_USER_AGENT = (
@@ -285,8 +291,50 @@ def _wait_for_status(
 async def _is_logged_in(page) -> bool:
     for marker in LOGIN_MARKERS:
         with contextlib.suppress(Exception):
-            if await page.locator(marker).first.is_visible():
+            locator = page.locator(marker)
+            if await locator.count() == 0:
+                continue
+            first = locator.first
+            if await first.is_visible():
                 return True
+            if await first.evaluate(
+                """(el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    return style && style.visibility !== "hidden" && style.display !== "none" && el.offsetParent !== null;
+                }"""
+            ):
+                return True
+    with contextlib.suppress(Exception):
+        detected = await page.evaluate(
+            """
+            () => {
+                try {
+                    const mainSelectors = [
+                        '[data-testid="chat-list"]',
+                        '[data-testid="conversation-panel-body"]',
+                        '[data-testid="conversation-panel-messages"]',
+                        'header[data-testid="chatlist-header"]'
+                    ];
+                    if (mainSelectors.some(sel => document.querySelector(sel))) {
+                        return true;
+                    }
+                    const localStateKeys = ["last-wid", "WASecretBundle", "WABrowserId"];
+                    return localStateKeys.some(key => {
+                        try {
+                            return Boolean(window.localStorage?.getItem(key));
+                        } catch (e) {
+                            return false;
+                        }
+                    });
+                } catch (err) {
+                    return false;
+                }
+            }
+            """
+        )
+        if detected:
+            return True
     return False
 
 async def _logout_if_needed(page) -> None:
