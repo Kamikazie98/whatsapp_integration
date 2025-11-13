@@ -1,4 +1,5 @@
 import re
+import time
 import frappe
 
 def _digits_only(phone: str) -> str:
@@ -38,7 +39,7 @@ def send_unofficial(device_name, number, message):
 				if cmd_id in _session_command_results:
 					result = _session_command_results.pop(cmd_id)
 					break
-			frappe.sleep(0.5)
+			time.sleep(0.5)
 
 		if result is None:
 			raise Exception("Request timed out. The WhatsApp service may be disconnected or busy.")
