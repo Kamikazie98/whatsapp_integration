@@ -66,14 +66,8 @@ QR_SELECTORS = [
 ]
 
 LOGIN_MARKERS = [
-    '[data-testid="side"]', # The main side panel
-    'div[title="New chat"]', # New chat button
-    'div[data-testid="chat-list-search"]',
-    'div[aria-label="Chat list"]',
-    'header[data-testid="chatlist-header"]',
-    'div[data-testid="chat-list"]',
-    'div[data-testid="conversation-panel-wrapper"]',
-    'div[data-testid="conversation-panel"]',
+    'button[aria-label="Chats"]', # Definitive selector from user's HTML
+    '[data-testid="side"]',       # Good fallback: the main side panel
 ]
 
 DEFAULT_USER_AGENT = (
