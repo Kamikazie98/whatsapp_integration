@@ -19,6 +19,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import logging
 import os
 import shutil
 import sys
@@ -27,6 +28,23 @@ import time
 import urllib.parse
 from pathlib import Path
 from typing import Optional, Tuple, Union
+
+# ---- Dedicated File Logger ---
+LOG_FILE = "/tmp/whatsapp_integration_playwright.log"
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+)
+wa_logger = logging.getLogger("whatsapp_playwright")
+wa_logger.setLevel(logging.DEBUG)
+# Avoid duplicate handlers if the script is reloaded
+if not wa_logger.handlers:
+    wa_logger.addHandler(file_handler)
+# ---- End Logger ----
+
 
 # ---- Failsafe: ensure Playwright browsers path & HOME are correct for bench ----
 os.environ.setdefault("HOME", "/home/frappe")
@@ -41,23 +59,15 @@ except Exception:
 WHATSAPP_WEB_URL = "https://web.whatsapp.com/"
 
 QR_SELECTORS = [
-    'div[data-testid="qrcode"] canvas',
-    'canvas[aria-label="Scan me!"]',
-    'div[data-ref] canvas',               # older builds
-    'img[alt="Scan me!"]',
-    'div[data-testid="qrcode"] img',
+    'div[class*="_akau"] canvas',          # Primary selector from user-provided HTML
+    'canvas[aria-label="Scan this QR code to link a device!"]', # New aria-label
+    'canvas[aria-label="Scan me!"]',      # Legacy
+    'div[data-testid="qrcode"] canvas',   # Legacy
 ]
 
 LOGIN_MARKERS = [
-    'div[data-testid="chat-list-search"]',
-    'div[aria-label="Chat list"]',
-    'header[data-testid="chatlist-header"]',
-    'div[data-testid="chat-list"]',
-    'div[data-testid="conversation-panel-wrapper"]',
-    'div[data-testid="conversation-panel-messages"]',
-    'div[data-testid="conversation-panel"]',
-    '[data-testid="conversation-panel-body"]',
-    'div[data-testid="chat"]',
+    'button[aria-label="Chats"]', # Definitive selector from user's HTML
+    '[data-testid="side"]',       # Good fallback: the main side panel
 ]
 
 DEFAULT_USER_AGENT = (
@@ -78,6 +88,12 @@ _active_pw_profiles: dict[str, Path] = {}
 _session_dump_dirs: dict[str, Path] = {}
 _session_user_hints: dict[str, Optional[str]] = {}
 _session_storage_files: dict[str, Path] = {}
+
+# --- New Command Queue Architecture ---
+_session_command_queues: dict[str, list[dict]] = {}
+_session_command_results: dict[str, dict] = {}
+# --- End New Architecture ---
+
 _pw_lock = threading.Lock()
 
 
@@ -228,13 +244,19 @@ def _sync_device_doc(session_id: str, payload: dict) -> None:
 
 async def _persist_storage_state(context, session_id: str, dump_dir: Union[str, Path]) -> Optional[Path]:
     """Persist current storage so other Playwright sessions can reuse the login."""
+    target = None
     try:
         target = _storage_state_path(session_id, dump_dir, ensure_parent=True)
         await context.storage_state(path=str(target))
         with _pw_lock:
             _session_storage_files[session_id] = target
+        _log_info(f"Session state for '{session_id}' persisted successfully.", f"Path: {target}")
         return target
-    except Exception:
+    except Exception as exc:
+        _log_error(
+            f"Failed to persist session state for '{session_id}'",
+            f"Path: {target if target else 'unknown'}\n{exc}",
+        )
         return None
 
 
@@ -246,10 +268,15 @@ def _profile_dir_path(session_id: str, dump_dir: Union[str, Path]) -> Path:
 
 def _session_profile_dir(session_id: str, dump_dir: Union[str, Path]) -> Path:
     """Return a stable Chrome profile directory per logical session."""
-    profile = _profile_dir_path(session_id, dump_dir)
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    profile.mkdir(parents=True, exist_ok=True)
-    return profile
+    profile = None
+    try:
+        profile = _profile_dir_path(session_id, dump_dir)
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.mkdir(parents=True, exist_ok=True)
+        return profile
+    except Exception as exc:
+        _log_error(f"Failed to create profile dir for session '{session_id}'", f"Path: {profile}\n{exc}")
+        raise
 
 
 def _storage_state_path(
@@ -258,11 +285,16 @@ def _storage_state_path(
     *,
     ensure_parent: bool = False,
 ) -> Path:
-    base = Path(dump_dir) / "storage_states"
-    if ensure_parent:
-        base.mkdir(parents=True, exist_ok=True)
-    safe = session_id.replace("/", "_").replace("\\", "_")
-    return base / f"{safe}.json"
+    base = None
+    try:
+        base = Path(dump_dir) / "storage_states"
+        if ensure_parent:
+            base.mkdir(parents=True, exist_ok=True)
+        safe = session_id.replace("/", "_").replace("\\", "_")
+        return base / f"{safe}.json"
+    except Exception as exc:
+        _log_error(f"Failed to create storage state path for session '{session_id}'", f"Base: {base}\n{exc}")
+        raise
 
 
 def _digits_only(phone: Optional[str]) -> str:
@@ -418,24 +450,29 @@ async def _snapshot_qr_once(page) -> Optional[str]:
 async def wait_for_qr(
     page,
     *,
-    timeout_ms: int = 90_000,
-    poll_ms: int = 1_250,
+    timeout_ms: int = 120_000,  # Increased timeout
+    poll_ms: int = 1_500,
     dump_dir: Union[str, Path] = DEFAULT_DUMP_DIR,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Find QR as data URL. On failure, save diagnostics and return (None, png_path)."""
+    _log_info(f"Starting to wait for QR code ({timeout_ms / 1000}s timeout)...")
     start = time.time()
     while (time.time() - start) * 1000 < timeout_ms:
         with contextlib.suppress(Exception):
             if await _is_logged_in(page):
+                _log_info("Detected logged-in state, attempting to log out to get QR screen.")
                 await _logout_if_needed(page)
 
-        for sel in QR_SELECTORS:
+        for i, sel in enumerate(QR_SELECTORS):
+            _log_info(f"  -> Trying QR selector #{i+1}: {sel}")
             data_url = await _try_extract_qr_dataurl(page, sel)
             if data_url:
+                _log_info("QR code found successfully.")
                 return data_url, None
 
         await asyncio.sleep(poll_ms / 1000.0)
 
+    _log_error("Timed out waiting for QR code.", f"Timeout was {timeout_ms / 1000}s.")
     # diagnostics
     diag_dir = Path(dump_dir); diag_dir.mkdir(parents=True, exist_ok=True)
     png_path = str(diag_dir / "whatsapp_qr_not_found.png")
@@ -451,8 +488,8 @@ async def generate_qr_base64(
     headless: bool = True,
     user_agent: Optional[str] = None,
     dump_dir: Union[str, Path] = DEFAULT_DUMP_DIR,
-    nav_timeout_ms: int = 120_000,
-    qr_timeout_ms: int = 90_000,
+    nav_timeout_ms: int = 150_000,  # Increased timeout
+    qr_timeout_ms: int = 120_000,
     proxy: Optional[dict] = None,
     extra_browser_args: Optional[list] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -486,111 +523,46 @@ async def generate_qr_base64(
             with contextlib.suppress(Exception): await browser.close()
 
 
-async def _send_message_pw_async(
-    *,
-    session_id: str,
-    phone_number: str,
-    message: str,
-    dump_dir: Union[str, Path],
-    headless: bool,
-    timeout_s: int,
-) -> dict:
-    """Send a WhatsApp message using the saved Playwright storage state."""
-    from playwright.async_api import async_playwright
-
+async def _send_message_pw_async(*, page, phone_number: str, message: str, timeout_s: int = 30) -> dict:
+    """Send a WhatsApp message using an existing, connected Playwright page."""
     dest = _digits_only(phone_number)
     if not dest:
         return {"success": False, "error": "Invalid destination number"}
 
-    dump_dir = Path(dump_dir)
-    with _pw_lock:
-        state_path = _session_storage_files.get(session_id)
-        profile_dir = _active_pw_profiles.get(session_id)
-    if not state_path:
-        state_path = _storage_state_path(session_id, dump_dir)
-    state_exists = Path(state_path).exists()
-    profile_path: Optional[Path] = None
-    if profile_dir:
-        profile_path = Path(profile_dir)
-    else:
-        # derive profile path from dump_dir even across process restarts
-        derived = _profile_dir_path(session_id, dump_dir)
-        if derived.exists():
-            profile_path = derived
+    chat_url = f"{WHATSAPP_WEB_URL}send?phone={dest}&text={urllib.parse.quote(message or '', safe='')}"
+    timestamp = frappe.utils.now() if frappe else time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-    chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
-    chat_url = (
-        f"{WHATSAPP_WEB_URL}send?"
-        f"phone={dest}&text={urllib.parse.quote(message or '', safe='')}"
-    )
-    timestamp = None
-    if frappe:
-        with contextlib.suppress(Exception):
-            timestamp = frappe.utils.now()
+    try:
+        await page.goto(chat_url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
 
-    async with async_playwright() as p:
-        # Prefer storage_state; if missing, fall back to persistent profile dir
-        if state_exists:
-            browser = await p.chromium.launch(headless=headless, args=chromium_args)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=DEFAULT_USER_AGENT,
-                java_script_enabled=True,
-                storage_state=str(state_path),
-            )
-        elif profile_path and profile_path.exists():
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(profile_path),
-                headless=headless,
-                args=chromium_args,
-                viewport={"width": 1280, "height": 900},
-                user_agent=DEFAULT_USER_AGENT,
-                java_script_enabled=True,
-            )
-            browser = None  # managed by context
-        else:
-            return {"success": False, "error": "Device is not connected (session profile missing)"}
+        send_selectors = [
+            "button[aria-label*='Send']",
+            "span[data-icon='send']",
+            "button[data-testid='compose-btn-send']",
+        ]
 
-        page = await context.new_page()
-        try:
-            await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
-            if not await _wait_for_login(page, timeout_s=max(timeout_s, 10)):
-                return {"success": False, "error": "WhatsApp session not authenticated"}
-            with contextlib.suppress(Exception):
-                await _persist_storage_state(context, session_id, dump_dir)
+        for sel in send_selectors:
+            try:
+                btn = page.locator(sel).first
+                # Use a shorter timeout per selector
+                await btn.wait_for(state="visible", timeout=10_000)
+                await btn.click(timeout=5_000)
+                await page.wait_for_timeout(1500) # Wait for message to appear sent
+                return {
+                    "success": True,
+                    "message_id": f"{dest}_{int(time.time())}",
+                    "timestamp": timestamp,
+                }
+            except Exception:
+                continue
 
-            send_selectors = [
-                "[data-testid='send']",
-                "button[aria-label='Send']",
-                "[data-testid='compose-btn-send']",
-            ]
-            for sel in send_selectors:
-                try:
-                    btn = page.locator(sel).first
-                    await btn.wait_for(state="visible", timeout=timeout_s * 1000)
-                    await btn.click()
-                    break
-                except Exception:
-                    continue
-            else:
-                return {"success": False, "error": "Send button not found"}
+        _log_error(f"Failed to send message to {dest}", "All send selectors failed.")
+        return {"success": False, "error": "Send button not found"}
 
-            await page.wait_for_timeout(1500)
-            if not timestamp:
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-            return {
-                "success": True,
-                "message_id": f"{session_id}_{dest}_{int(time.time())}",
-                "timestamp": timestamp,
-            }
-        finally:
-            with contextlib.suppress(Exception):
-                await page.close()
-            with contextlib.suppress(Exception):
-                await context.close()
-            if "browser" in locals() and browser:
-                with contextlib.suppress(Exception):
-                    await browser.close()
+    except Exception as e:
+        _log_error(f"Error during message sending to {dest}", f"{e.__class__.__name__}: {e}")
+        _log_traceback("send_message_pw")
+        return {"success": False, "error": str(e)}
 
 
 def send_message_pw(
@@ -636,8 +608,10 @@ def _ensure_pw_monitor(
     with _pw_lock:
         thread = _active_pw_threads.get(session_id)
         if thread and thread.is_alive():
+            _log_info(f"PW monitor for '{session_id}' is already running.")
             return
 
+        _log_info(f"Starting new PW monitor for '{session_id}'...")
         dump_path = Path(dump_dir)
         dump_path.mkdir(parents=True, exist_ok=True)
         _session_dump_dirs[session_id] = dump_path
@@ -669,33 +643,59 @@ def _pw_monitor_entry(
     site: Optional[str] = None,
     profile_dir: Optional[str] = None,
 ) -> None:
-    ctx_initialized = False
-    if frappe and site:
+    """Thread entrypoint. Manages Frappe context and retry loop for the async monitor."""
+    max_retries = 5
+    base_wait = 2.0  # seconds
+
+    for i in range(max_retries):
+        if stop_event.is_set():
+            _log_info(f"Stopping PW monitor for '{session_id}' by request.")
+            break
+
+        ctx_initialized = False
         try:
-            frappe.init(site=site)
-            ctx_initialized = True
-            frappe.connect()
-        except Exception as exc:
-            sys.stderr.write(f"[PW Monitor] Failed to init frappe site '{site}': {exc}\n")
-    try:
-        asyncio.run(
-            _pw_monitor_async(
-                session_id=session_id,
-                stop_event=stop_event,
-                headless=headless,
-                dump_dir=dump_dir,
-                qr_timeout_ms=qr_timeout_ms,
-                profile_dir=profile_dir,
+            if frappe and site:
+                try:
+                    frappe.init(site=site)
+                    ctx_initialized = True
+                    frappe.connect()
+                except Exception as exc:
+                    sys.stderr.write(f"[PW Monitor] Failed to init frappe site '{site}': {exc}\n")
+
+            _log_info(f"Starting PW monitor attempt #{i + 1} for '{session_id}'.")
+            asyncio.run(
+                _pw_monitor_async(
+                    session_id=session_id,
+                    stop_event=stop_event,
+                    headless=headless,
+                    dump_dir=dump_dir,
+                    qr_timeout_ms=qr_timeout_ms,
+                    profile_dir=profile_dir,
+                )
             )
-        )
-    finally:
-        if ctx_initialized and frappe:
-            with contextlib.suppress(Exception):
-                frappe.destroy()
-        with _pw_lock:
-            _active_pw_threads.pop(session_id, None)
-            _active_pw_stop.pop(session_id, None)
-            _session_user_hints.pop(session_id, None)
+            _log_info(f"PW monitor for '{session_id}' completed its run.")
+            break  # success, no retry needed
+
+        except Exception as exc:
+            _log_error(f"Playwright monitor for '{session_id}' crashed", f"{exc}")
+            if i < max_retries - 1 and not stop_event.is_set():
+                wait_time = base_wait * (2**i)
+                _log_info(f"Retrying PW monitor for '{session_id}' in {wait_time:.1f}s...")
+                stop_event.wait(wait_time)
+            else:
+                _log_error(f"PW monitor for '{session_id}' failed after max retries.", "Giving up.")
+                _store_status(session_id, "error", message="Monitor crashed permanently", publish=True)
+                break
+        finally:
+            if ctx_initialized and frappe:
+                with contextlib.suppress(Exception):
+                    frappe.destroy()
+
+    with _pw_lock:
+        _log_info(f"Cleaning up PW monitor thread references for '{session_id}'.")
+        _active_pw_threads.pop(session_id, None)
+        _active_pw_stop.pop(session_id, None)
+        _session_user_hints.pop(session_id, None)
 
 
 async def _pw_monitor_async(
@@ -751,56 +751,81 @@ async def _pw_monitor_async(
             monitor_deadline = time.time() + QR_MONITOR_SECS
             misses = 0
             connected = False
+            post_scan_diag_captured = False
+            ambiguous_disconnect_count = 0
+            AMBIGUOUS_DISCONNECT_THRESHOLD = 3
 
             while not stop_event.is_set():
-                with contextlib.suppress(Exception):
-                    if await _is_logged_in(page):
-                        if not connected:
-                            connected = True
-                            await _persist_storage_state(context, session_id, dump_dir)
-                            _store_status(
-                                session_id,
-                                "connected",
-                                message="Successfully connected to WhatsApp",
-                                publish=True,
-                            )
-                        await asyncio.sleep(5)
-                        continue
-                    if connected:
-                        # Lost connection -> force QR screen again
-                        connected = False
-                        monitor_deadline = time.time() + QR_MONITOR_SECS
-                        await _logout_if_needed(page)
+                if await _is_logged_in(page):
+                    # --- STATE: LOGGED IN ---
+                    ambiguous_disconnect_count = 0
+                    if not connected:
+                        _log_info(f"Session '{session_id}' is now connected (login markers found).")
+                        connected = True
+                        post_scan_diag_captured = True
+                        await _persist_storage_state(context, session_id, dump_dir)
+                        _store_status(session_id, "connected", message="Connected", publish=True)
 
-                if not connected and time.time() > monitor_deadline:
-                    break
+                    # Process command queue...
+                    commands_to_run = []
+                    with _pw_lock:
+                        if session_id in _session_command_queues:
+                            commands_to_run = _session_command_queues.pop(session_id, [])
+                    for cmd in commands_to_run:
+                        cmd_id = cmd.get("id")
+                        _log_info(f"Executing command '{cmd.get('type')}' with ID '{cmd_id}'")
+                        result = {}
+                        if cmd.get("type") == "send_message":
+                            result = await _send_message_pw_async(page=page, phone_number=cmd.get("phone_number"), message=cmd.get("message"))
+                        if cmd_id:
+                            with _pw_lock:
+                                _session_command_results[cmd_id] = result
 
-                if connected:
-                    await asyncio.sleep(5)
-                    continue
+                    await asyncio.sleep(2) # Poll for commands/status every 2s
 
-                fresh_qr = await _snapshot_qr_once(page)
-                if fresh_qr:
-                    misses = 0
-                    fresh_hash = _qr_hash(fresh_qr)
-                    if fresh_hash and fresh_hash != last_hash:
-                        last_hash = fresh_hash
-                        monitor_deadline = time.time() + QR_MONITOR_SECS
-                        _store_status(
-                            session_id,
-                            "qr_generated",
-                            qr=fresh_qr,
-                            message="QR refreshed",
-                            publish=True,
-                        )
                 else:
-                    misses += 1
-                    if misses >= 5:
-                        with contextlib.suppress(Exception):
-                            await _logout_if_needed(page)
-                        misses = 0
+                    # --- STATE: NOT LOGGED IN ---
+                    qr_is_visible = await _snapshot_qr_once(page)
 
-                await asyncio.sleep(QR_REFRESH_INTERVAL)
+                    if qr_is_visible:
+                        # Case 1: Definite disconnect (QR screen is showing)
+                        _log_error(f"Session '{session_id}' is disconnected. QR code is visible.", "Forcing new QR.")
+                        connected = False
+                        ambiguous_disconnect_count = 0
+                        misses = 0
+                        last_hash = _qr_hash(qr_is_visible)
+                        monitor_deadline = time.time() + QR_MONITOR_SECS
+                        _store_status(session_id, "qr_generated", qr=qr_is_visible, message="QR refreshed", publish=True)
+
+                    elif connected:
+                        # Case 2: Ambiguous disconnect (Was connected, now see neither login nor QR)
+                        ambiguous_disconnect_count += 1
+                        _log_info(f"Ambiguous disconnect check {ambiguous_disconnect_count}/{AMBIGUOUS_DISCONNECT_THRESHOLD}")
+                        if ambiguous_disconnect_count >= AMBIGUOUS_DISCONNECT_THRESHOLD:
+                             _log_error(f"Session '{session_id}' lost connection (ambiguous state).", "Forcing new QR.")
+                             connected = False
+                             await _logout_if_needed(page)
+
+                    # Capture post-scan diagnostics if needed
+                    if not post_scan_diag_captured and not qr_is_visible and last_hash:
+                         _log_info("QR not visible, assuming scan. Capturing post-login diagnostics...")
+                         await asyncio.sleep(7)
+                         # ... (diagnostic capture logic remains the same)
+                         diag_dir = Path(dump_dir); diag_dir.mkdir(parents=True, exist_ok=True)
+                         ss_path = diag_dir / "post_login_screenshot.png"
+                         await page.screenshot(path=str(ss_path), full_page=True)
+                         _log_info(f"Saved post-login screenshot to {ss_path}")
+                         html_path = diag_dir / "post_login_page.html"
+                         html_content = await page.content()
+                         await _safe_write_text(html_path, html_content)
+                         _log_info(f"Saved post-login HTML to {html_path}")
+                         post_scan_diag_captured = True
+
+                    if time.time() > monitor_deadline and not connected:
+                        _log_error(f"QR monitoring for '{session_id}' timed out.", "Exiting.")
+                        break
+
+                    await asyncio.sleep(3) # Wait a bit longer in disconnected states
     except Exception as exc:
         _store_status(session_id, "error", message=str(exc), publish=True)
     finally:
@@ -814,6 +839,12 @@ async def _pw_monitor_async(
             _active_pw_profiles.pop(session_id, None)
 
 # --------------- Frappe integration ---------------
+import traceback
+
+def _log_traceback(context: str):
+    """Logs the current exception's traceback to the dedicated log file."""
+    wa_logger.error(f"Traceback ({context}):\n{traceback.format_exc()}")
+
 def _run_async(coro):
     try:
         asyncio.get_running_loop()
@@ -825,15 +856,27 @@ def _run_async(coro):
     finally:
         loop.close()
 
-def _log_error(title: str, detail: str) -> None:
-    title = (title or "Error")[:140]
+
+def _log_info(title: str, detail: str | None = None) -> None:
+    msg = f"{title}{f' - {detail}' if detail else ''}"
+    wa_logger.info(msg)
     if not frappe:
-        sys.stderr.write(f"[ERROR] {title}\n{detail}\n")
+        return
+    try:
+        frappe.logger("whatsapp").info(title, detail)
+    except Exception:
+        pass
+
+
+def _log_error(title: str, detail: str) -> None:
+    msg = f"{title}{f' - {detail}' if detail else ''}"
+    wa_logger.error(msg)
+    if not frappe:
         return
     try:
         frappe.log_error(title, detail)
     except Exception:
-        sys.stderr.write(f"[FRAPPE LOG ERROR FAILED] {title}\n{detail}\n")
+        pass
 
 def _publish_qr_event(session_id: str, status: str, *, b64: Optional[str] = None, diag: Optional[str] = None) -> None:
     if not frappe:

@@ -105,6 +105,11 @@ override_whitelisted_methods = {
 # automatically create page for each record of this doctype
 # website_generators = ["Web Page"]
 
+# Allow guest access to the webhook
+api_allowed_guest = [
+    "whatsapp_integration.api.webhook_handler.handle_webhook",
+]
+
 # Jinja
 # ----------
 

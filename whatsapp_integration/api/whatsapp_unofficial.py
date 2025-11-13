@@ -1,70 +1,53 @@
 import re
+import time
 import frappe
 
 def _digits_only(phone: str) -> str:
 	return re.sub(r"\D", "", phone or "")
 
-def _pick_connected_session():
-	"""Pick a usable session id from WhatsApp Device or Playwright status."""
-	connected = frappe.db.get_value("WhatsApp Device", {"status": "Connected"}, "name")
-	if connected:
-		return connected
-
+def send_unofficial(device_name, number, message):
+	"""Enqueue a 'send_message' command for the active Playwright service."""
 	try:
-		from whatsapp_integration.api.whatsapp_playwright import check_qr_status_pw
-		devices = frappe.get_all("WhatsApp Device", fields=["name", "status"], order_by="modified desc", limit=5)
-		for d in devices:
-			st = check_qr_status_pw(d.name) or {}
-			if st.get("status") == "connected":
-				if d.status != "Connected":
-					try:
-						frappe.db.set_value(
-							"WhatsApp Device",
-							d.name,
-							{
-								"status": "Connected",
-								"last_sync": frappe.utils.now(),
-							},
-						)
-					except Exception:
-						pass
-				return d.name
-	except Exception:
-		pass
+		from whatsapp_integration.api.whatsapp_playwright import (
+			_session_command_queues,
+			_session_command_results,
+			_pw_lock,
+		)
 
-	any_dev = frappe.db.get_value("WhatsApp Device", {}, "name")
-	return any_dev
-
-
-def send_unofficial(number, message):
-	"""Send message using Playwright (Unofficial WhatsApp Web).
-	- Prefer Playwright persistent profile
-	- Fallback to basic python sender
-	"""
-	try:
-		session_id = _pick_connected_session()
+		device_doc = frappe.get_doc("WhatsApp Device", device_name)
+		session_id = device_doc.number
 		if not session_id:
-			raise Exception("No connected WhatsApp device. Please scan QR and connect a device first.")
+			raise Exception(f"Device '{device_name}' does not have a number set.")
 
-		dest = _digits_only(number)
-		if not dest:
-			raise Exception("Invalid destination number")
+		cmd_id = f"send_{session_id}_{frappe.generate_hash(length=8)}"
+		command = {
+			"id": cmd_id,
+			"type": "send_message",
+			"phone_number": number,
+			"message": message,
+		}
 
-		# 1) Playwright first
-		try:
-			from whatsapp_integration.api.whatsapp_playwright import send_message_pw
-			result = send_message_pw(session_id, dest, message)
-			if isinstance(result, dict) and result.get("success"):
-				return result
-		except Exception as pw_err:
-			frappe.log_error("WhatsApp Unofficial Send", f"PW send failed: {pw_err}")
+		with _pw_lock:
+			_session_command_queues.setdefault(session_id, []).append(command)
 
-		# 2) Simple fallback
-		from whatsapp_integration.api.whatsapp_python import send_message
-		result = send_message(session_id, dest, message)
-		if result.get("success"):
-			return result
-		raise Exception(result.get("error", "Failed to send message"))
+		# Wait for the result
+		timeout = 30  # seconds
+		deadline = frappe.utils.now_datetime() + frappe.utils.datetime.timedelta(seconds=timeout)
+		result = None
+		while frappe.utils.now_datetime() < deadline:
+			with _pw_lock:
+				if cmd_id in _session_command_results:
+					result = _session_command_results.pop(cmd_id)
+					break
+			time.sleep(0.5)
+
+		if result is None:
+			raise Exception("Request timed out. The WhatsApp service may be disconnected or busy.")
+
+		if not result.get("success"):
+			raise Exception(result.get("error", "Failed to send message via active session"))
+
+		return result
 
 	except Exception as e:
 		message = f"Failed to send message: {str(e)}"
