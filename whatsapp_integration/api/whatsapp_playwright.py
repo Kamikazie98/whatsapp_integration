@@ -752,14 +752,13 @@ async def _pw_monitor_async(
             misses = 0
             connected = False
             post_scan_diag_captured = False
-            disconnect_checks = 0
-            DISCONNECT_THRESHOLD = 3 # Require 3 failed checks before disconnecting
+            ambiguous_disconnect_count = 0
+            AMBIGUOUS_DISCONNECT_THRESHOLD = 3
 
             while not stop_event.is_set():
-                is_logged_in_now = await _is_logged_in(page)
-
-                if is_logged_in_now:
-                    disconnect_checks = 0  # Reset counter on any successful check
+                if await _is_logged_in(page):
+                    # --- STATE: LOGGED IN ---
+                    ambiguous_disconnect_count = 0
                     if not connected:
                         _log_info(f"Session '{session_id}' is now connected (login markers found).")
                         connected = True
@@ -773,7 +772,6 @@ async def _pw_monitor_async(
                         if session_id in _session_command_queues:
                             commands_to_run = _session_command_queues.pop(session_id, [])
                     for cmd in commands_to_run:
-                        # ... (command execution logic remains the same)
                         cmd_id = cmd.get("id")
                         _log_info(f"Executing command '{cmd.get('type')}' with ID '{cmd_id}'")
                         result = {}
@@ -784,62 +782,50 @@ async def _pw_monitor_async(
                                 _session_command_results[cmd_id] = result
 
                     await asyncio.sleep(2) # Poll for commands/status every 2s
-                    continue
 
-                # --- We are NOT logged in at this moment ---
-
-                if connected:
-                    # We *were* connected, but the check just failed. Start grace period.
-                    disconnect_checks += 1
-                    _log_info(f"Login check failed. Disconnect counter: {disconnect_checks}/{DISCONNECT_THRESHOLD}")
-                    if disconnect_checks >= DISCONNECT_THRESHOLD:
-                        _log_error(f"Session '{session_id}' lost connection after {DISCONNECT_THRESHOLD} failed checks.", "Forcing new QR code.")
-                        connected = False
-                        monitor_deadline = time.time() + QR_MONITOR_SECS
-                        await _logout_if_needed(page)
-
-                    await asyncio.sleep(2) # Wait 2s before next check
-                    continue
-
-                # --- We are fully disconnected, waiting for QR ---
-                if time.time() > monitor_deadline:
-                    _log_error(f"QR monitoring for '{session_id}' timed out.", "Exiting.")
-                    break
-
-                fresh_qr = await _snapshot_qr_once(page)
-                if fresh_qr:
-                    misses = 0
-                    fresh_hash = _qr_hash(fresh_qr)
-                    if fresh_hash and fresh_hash != last_hash:
-                        last_hash = fresh_hash
-                        monitor_deadline = time.time() + QR_MONITOR_SECS
-                        _store_status(session_id, "qr_generated", qr=fresh_qr, message="QR refreshed", publish=True)
                 else:
-                    # --- ADVANCED DEBUGGING: QR has disappeared ---
-                    if not post_scan_diag_captured and last_hash:
-                        _log_info("QR not visible, assuming scan happened. Capturing post-login diagnostics...")
-                        await asyncio.sleep(7) # Wait for chat interface to load
+                    # --- STATE: NOT LOGGED IN ---
+                    qr_is_visible = await _snapshot_qr_once(page)
 
-                        diag_dir = Path(dump_dir); diag_dir.mkdir(parents=True, exist_ok=True)
-
-                        ss_path = diag_dir / "post_login_screenshot.png"
-                        await page.screenshot(path=str(ss_path), full_page=True)
-                        _log_info(f"Saved post-login screenshot to {ss_path}")
-
-                        html_path = diag_dir / "post_login_page.html"
-                        html_content = await page.content()
-                        await _safe_write_text(html_path, html_content)
-                        _log_info(f"Saved post-login HTML to {html_path}")
-
-                        post_scan_diag_captured = True # Only capture once
-
-                    misses += 1
-                    if misses >= 10: # Increased threshold
-                        with contextlib.suppress(Exception):
-                            await _logout_if_needed(page)
+                    if qr_is_visible:
+                        # Case 1: Definite disconnect (QR screen is showing)
+                        _log_error(f"Session '{session_id}' is disconnected. QR code is visible.", "Forcing new QR.")
+                        connected = False
+                        ambiguous_disconnect_count = 0
                         misses = 0
+                        last_hash = _qr_hash(qr_is_visible)
+                        monitor_deadline = time.time() + QR_MONITOR_SECS
+                        _store_status(session_id, "qr_generated", qr=qr_is_visible, message="QR refreshed", publish=True)
 
-                await asyncio.sleep(QR_REFRESH_INTERVAL)
+                    elif connected:
+                        # Case 2: Ambiguous disconnect (Was connected, now see neither login nor QR)
+                        ambiguous_disconnect_count += 1
+                        _log_info(f"Ambiguous disconnect check {ambiguous_disconnect_count}/{AMBIGUOUS_DISCONNECT_THRESHOLD}")
+                        if ambiguous_disconnect_count >= AMBIGUOUS_DISCONNECT_THRESHOLD:
+                             _log_error(f"Session '{session_id}' lost connection (ambiguous state).", "Forcing new QR.")
+                             connected = False
+                             await _logout_if_needed(page)
+
+                    # Capture post-scan diagnostics if needed
+                    if not post_scan_diag_captured and not qr_is_visible and last_hash:
+                         _log_info("QR not visible, assuming scan. Capturing post-login diagnostics...")
+                         await asyncio.sleep(7)
+                         # ... (diagnostic capture logic remains the same)
+                         diag_dir = Path(dump_dir); diag_dir.mkdir(parents=True, exist_ok=True)
+                         ss_path = diag_dir / "post_login_screenshot.png"
+                         await page.screenshot(path=str(ss_path), full_page=True)
+                         _log_info(f"Saved post-login screenshot to {ss_path}")
+                         html_path = diag_dir / "post_login_page.html"
+                         html_content = await page.content()
+                         await _safe_write_text(html_path, html_content)
+                         _log_info(f"Saved post-login HTML to {html_path}")
+                         post_scan_diag_captured = True
+
+                    if time.time() > monitor_deadline and not connected:
+                        _log_error(f"QR monitoring for '{session_id}' timed out.", "Exiting.")
+                        break
+
+                    await asyncio.sleep(3) # Wait a bit longer in disconnected states
     except Exception as exc:
         _store_status(session_id, "error", message=str(exc), publish=True)
     finally:
