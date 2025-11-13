@@ -492,10 +492,18 @@ async def _send_message_pw_async(
     dump_dir = Path(dump_dir)
     with _pw_lock:
         state_path = _session_storage_files.get(session_id)
+        profile_dir = _active_pw_profiles.get(session_id)
     if not state_path:
         state_path = _storage_state_path(session_id, dump_dir)
-    if not Path(state_path).exists():
-        return {"success": False, "error": "Device is not connected (storage missing)"}
+    state_exists = Path(state_path).exists()
+    profile_path: Optional[Path] = None
+    if profile_dir:
+        profile_path = Path(profile_dir)
+    else:
+        # derive profile path from dump_dir even across process restarts
+        derived = _profile_dir_path(session_id, dump_dir)
+        if derived.exists():
+            profile_path = derived
 
     chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
     chat_url = (
@@ -508,13 +516,27 @@ async def _send_message_pw_async(
             timestamp = frappe.utils.now()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, args=chromium_args)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=DEFAULT_USER_AGENT,
-            java_script_enabled=True,
-            storage_state=str(state_path),
-        )
+        # Prefer storage_state; if missing, fall back to persistent profile dir
+        if state_exists:
+            browser = await p.chromium.launch(headless=headless, args=chromium_args)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=DEFAULT_USER_AGENT,
+                java_script_enabled=True,
+                storage_state=str(state_path),
+            )
+        elif profile_path and profile_path.exists():
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_path),
+                headless=headless,
+                args=chromium_args,
+                viewport={"width": 1280, "height": 900},
+                user_agent=DEFAULT_USER_AGENT,
+                java_script_enabled=True,
+            )
+            browser = None  # managed by context
+        else:
+            return {"success": False, "error": "Device is not connected (session profile missing)"}
         page = await context.new_page()
         try:
             await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
@@ -546,7 +568,8 @@ async def _send_message_pw_async(
         finally:
             with contextlib.suppress(Exception): await page.close()
             with contextlib.suppress(Exception): await context.close()
-            with contextlib.suppress(Exception): await browser.close()
+            if 'browser' in locals() and browser:
+                with contextlib.suppress(Exception): await browser.close()
 
 
 def send_message_pw(
