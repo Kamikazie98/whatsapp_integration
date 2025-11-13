@@ -518,15 +518,15 @@ async def _send_message_pw_async(
         if derived.exists():
             profile_path = derived
 
-    chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
-    chat_url = (
-        f"{WHATSAPP_WEB_URL}send?"
-        f"phone={dest}&text={urllib.parse.quote(message or '', safe='')}"
-    )
-    timestamp = None
-    if frappe:
-        with contextlib.suppress(Exception):
-            timestamp = frappe.utils.now()
+	chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+	chat_url = (
+		f"{WHATSAPP_WEB_URL}send?"
+		f"phone={dest}&text={urllib.parse.quote(message or '', safe='')}"
+	)
+	timestamp = None
+	if frappe:
+		with contextlib.suppress(Exception):
+			timestamp = frappe.utils.now()
 
 	async with async_playwright() as p:
 		# Prefer storage_state; if missing, fall back to persistent profile dir
@@ -550,6 +550,7 @@ async def _send_message_pw_async(
 			browser = None  # managed by context
 		else:
 			return {"success": False, "error": "Device is not connected (session profile missing)"}
+
 		page = await context.new_page()
 		try:
 			await page.goto(chat_url, wait_until="networkidle", timeout=max(timeout_s, 5) * 1000)
@@ -557,6 +558,7 @@ async def _send_message_pw_async(
 				return {"success": False, "error": "WhatsApp session not authenticated"}
 			with contextlib.suppress(Exception):
 				await _persist_storage_state(context, session_id, dump_dir)
+
 			send_selectors = [
 				"[data-testid='send']",
 				"button[aria-label='Send']",
@@ -572,6 +574,7 @@ async def _send_message_pw_async(
 					continue
 			else:
 				return {"success": False, "error": "Send button not found"}
+
 			await page.wait_for_timeout(1500)
 			if not timestamp:
 				timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -581,10 +584,13 @@ async def _send_message_pw_async(
 				"timestamp": timestamp,
 			}
 		finally:
-			with contextlib.suppress(Exception): await page.close()
-			with contextlib.suppress(Exception): await context.close()
+			with contextlib.suppress(Exception):
+				await page.close()
+			with contextlib.suppress(Exception):
+				await context.close()
 			if "browser" in locals() and browser:
-				with contextlib.suppress(Exception): await browser.close()
+				with contextlib.suppress(Exception):
+					await browser.close()
 
 
 def send_message_pw(
