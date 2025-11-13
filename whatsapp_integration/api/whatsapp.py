@@ -6,7 +6,8 @@ from whatsapp_integration.api.whatsapp_unofficial import send_unofficial
 def send_whatsapp_message(number, message, device=None):
     """Unified entry point for sending WhatsApp messages"""
     settings = frappe.get_doc("WhatsApp Settings")
-    device_name = device or settings.default_device
+    # Safely get default_device to avoid AttributeError if the field doesn't exist
+    device_name = device or getattr(settings, "default_device", None)
 
     if not device_name:
         frappe.throw("No device specified and no default device is set.")
