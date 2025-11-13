@@ -16,14 +16,23 @@ class WhatsAppDevice(Document):
 		"""Manually mark device as connected (for testing)."""
 		try:
 			from whatsapp_integration.api.whatsapp_simple import set_session_connected
-
 			result = set_session_connected(self.number)
 			if result.get("success"):
-				self._update_fields({"status": "Connected"})
+				self._update_fields({"status": "Connected", "last_sync": frappe.utils.now()})
 				return {"success": True, "message": "Device marked as connected"}
 			return {"success": False, "message": "Failed to mark device as connected"}
 		except Exception as exc:
 			frappe.log_error(f"Mark Connected Error: {exc}", "WhatsApp Mark Connected")
+			return {"success": False, "message": f"Error: {exc}"}
+
+	@frappe.whitelist()
+	def mark_disconnected(self):
+		"""Manually mark device as disconnected (for testing / recovery)."""
+		try:
+			self._update_fields({"status": "Disconnected"})
+			return {"success": True, "message": "Device marked as disconnected"}
+		except Exception as exc:
+			frappe.log_error(f"Mark Disconnected Error: {exc}", "WhatsApp Mark Disconnected")
 			return {"success": False, "message": f"Error: {exc}"}
 
 	@frappe.whitelist()

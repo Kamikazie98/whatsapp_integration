@@ -88,6 +88,8 @@ frappe.ui.form.on('WhatsApp Device', {
                                 indicator: status.status === 'connected' ? 'green' :
                                           (status.status === 'qr_generated' || status.status === 'qr_ready') ? 'blue' : 'red'
                             });
+                            // Always refresh doc to reflect latest status/qr
+                            frm.reload_doc();
                         }
                     },
                     error: function(r) {
@@ -97,6 +99,27 @@ frappe.ui.form.on('WhatsApp Device', {
                             indicator: 'red'
                         });
                     }
+                });
+            }, __('Actions'));
+
+            // Manual status controls (useful for recovery/testing)
+            frm.add_custom_button(__('Mark Connected (Manual)'), function() {
+                frm.call('mark_connected').then((res) => {
+                    const ok = res && res.message && res.message.success;
+                    frappe.show_alert({ message: ok ? __('Marked as Connected') : __('Failed to mark connected'), indicator: ok ? 'green' : 'red' }, 5);
+                    frm.reload_doc();
+                }).catch(() => {
+                    frappe.show_alert({ message: __('Failed to mark connected'), indicator: 'red' }, 5);
+                });
+            }, __('Actions'));
+
+            frm.add_custom_button(__('Mark Disconnected (Manual)'), function() {
+                frm.call('mark_disconnected').then((res) => {
+                    const ok = res && res.message && res.message.success;
+                    frappe.show_alert({ message: ok ? __('Marked as Disconnected') : __('Failed to mark disconnected'), indicator: ok ? 'orange' : 'red' }, 5);
+                    frm.reload_doc();
+                }).catch(() => {
+                    frappe.show_alert({ message: __('Failed to mark disconnected'), indicator: 'red' }, 5);
                 });
             }, __('Actions'));
 
