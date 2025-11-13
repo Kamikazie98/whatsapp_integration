@@ -96,14 +96,71 @@ frappe.ui.form.on('WhatsApp Device', {
                         }
                     },
                     error: function(r) {
-						const data = (r && r.message) || r || {};
-						const detail = data.message || data.exc || __('Failed to check connection status. Please try again.');
-						const extra = data.traceback ? `\n\n${__("Traceback")}: ${data.traceback}` : '';
+						const sources = [];
+						if (r && typeof r === 'object') {
+							sources.push(r);
+						}
+						if (r && typeof r.message === 'object') {
+							sources.push(r.message);
+						}
+						if (r && r.responseJSON) {
+							sources.push(r.responseJSON);
+						}
+
+						const detailChunks = [];
+						const pushChunk = (label, value) => {
+							if (!value) {
+								return;
+							}
+							if (label) {
+								detailChunks.push(`${label}: ${value}`);
+							} else {
+								detailChunks.push(value);
+							}
+						};
+
+						const appendServerMessages = (raw) => {
+							if (!raw) {
+								return;
+							}
+							try {
+								const parsed = frappe.utils.parse_json(raw);
+								if (Array.isArray(parsed)) {
+									parsed.forEach((msg) => pushChunk(null, msg));
+									return;
+								}
+							} catch (e) {
+								// fall through to push raw message
+							}
+							pushChunk(null, raw);
+						};
+
+						sources.forEach((source) => {
+							if (!source) {
+								return;
+							}
+							const data = source || {};
+							pushChunk(__('Message'), data.message);
+							pushChunk(__('Detail'), data._error_message);
+							pushChunk(__('Exception'), data.exc);
+							pushChunk(__('Traceback'), data.traceback || data._server_traceback);
+							appendServerMessages(data._server_messages);
+						});
+
+						if (!detailChunks.length) {
+							detailChunks.push(__('Failed to check connection status. Please try again.'));
+						}
+
+						const logText = detailChunks.join('\n\n---\n\n');
+						const html = `<pre style="max-height:400px;overflow:auto;">${frappe.utils.escape_html(logText)}</pre>`;
+
 						frappe.msgprint({
 							title: __('Connection Status Error'),
-							message: `${detail}${extra}`,
+							message: html,
 							indicator: 'red'
 						});
+
+						console.error('Check Status request failed:', r);
                     }
                 });
             }, __('Actions'));
