@@ -101,13 +101,13 @@ export async function startSession(sessionId) {
         const loggedOut = statusCode === DisconnectReason.loggedOut;
         console.log(`Connection closed for ${sid} (status: ${statusCode})`);
 
+        const removed = deviceRemoved || loggedOut;
         try {
-          if (deviceRemoved || loggedOut) {
+          if (removed) {
             if (fs.existsSync(authPath)) {
               fs.rmSync(authPath, { recursive: true, force: true });
               console.log(`Cleared session directory for ${sid}`);
             }
-            delete sessions[sid];
             delete qrCodes[sid];
             // impose backoff to avoid rapid re-pair attempts the phone may reject
             backoffUntil.set(sid, Date.now() + 60_000);
@@ -117,8 +117,13 @@ export async function startSession(sessionId) {
         }
         // Always drop the in-memory session handle so restart can proceed
         delete sessions[sid];
-        const delay = deviceRemoved || loggedOut ? 5000 : 1500;
-        setTimeout(() => startSession(sid), delay);
+        if (!removed) {
+          setTimeout(() => startSession(sid), 1500);
+        } else {
+          console.log(
+            `Session ${sid} disabled after device removal/log out; waiting for manual restart`
+          );
+        }
       } else if (connection === "open") {
         console.log(`WhatsApp session ${sid} connected`);
         delete qrCodes[sid];
@@ -138,7 +143,7 @@ export async function startSession(sessionId) {
             "Media message";
 
           await axios.post(config.erpnext_webhook, {
-            session: sessionId,
+            session: sid,
             from: msg.key.remoteJid.replace("@s.whatsapp.net", ""),
             text: messageText,
             timestamp: new Date().toISOString(),
