@@ -29,7 +29,6 @@ def send_unofficial(number, message):
             limit=1,
         )
         if not device:
-            frappe.log_error("No connected WhatsApp device found.", "WhatsApp Unofficial Send")
             # Try a QR-generated device as fallback (waiting for scan)
             pending = frappe.get_list(
                 "WhatsApp Device",
@@ -42,19 +41,15 @@ def send_unofficial(number, message):
             raise Exception("WhatsApp device not connected yet. Please scan QR on a device and try again.")
 
         session_id = device[0]["number"]
-        frappe.log_info(f"Sending message via device {session_id}", "WhatsApp Unofficial Send")
 
         base = _get_node_base_url()
         payload = {"session": session_id, "to": number, "message": message}
         resp = requests.post(f"{base}/sendMessage", json=payload, timeout=20)
         if resp.status_code != 200:
-            frappe.log_error(f"Node send error: HTTP {resp.status_code} {resp.text}", "WhatsApp Unofficial Send")
             raise Exception(f"Node send error: HTTP {resp.status_code} {resp.text}")
         data = resp.json()
         if not data.get("success"):
-            frappe.log_error(f"Node send error: {data.get('error')}", "WhatsApp Unofficial Send")
             raise Exception(data.get("error") or "Unknown send error")
-        frappe.log_info(f"Message sent successfully to {number}", "WhatsApp Unofficial Send")
         return data
     except Exception as e:
         frappe.log_error(f"Unofficial send error (Node): {str(e)}", "WhatsApp Unofficial Send")

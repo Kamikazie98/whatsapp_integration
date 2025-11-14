@@ -8,12 +8,6 @@ if ((config.engine || 'baileys').toLowerCase() === 'wwebjs') {
   impl = await import('./whatsapp.js');
 }
 
-export function setWebSocketServer(wss) {
-  if (impl.setWebSocketServer) {
-    impl.setWebSocketServer(wss);
-  }
-}
-
 export const getQR = impl.getQR;
 export const startSession = impl.startSession;
 export const sendMessage = impl.sendMessage;

@@ -1,11 +1,12 @@
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("baileys");
 import QRCode from "qrcode";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
 import config from "./config.js";
+import pino from "pino";
 
 // Normalize and stabilize session storage path
 const sessionRoot = path.isAbsolute(config.session_path)
@@ -23,17 +24,6 @@ let sessions = {};
 let qrCodes = {};
 const starting = new Set(); // prevent concurrent startSession per sid
 const backoffUntil = new Map(); // sid -> timestamp ms when next attempt is allowed
-let wss;
-
-export function setWebSocketServer(wsServer) {
-  wss = wsServer;
-  wss.on('connection', ws => {
-    console.log('WebSocket client connected');
-    ws.on('message', message => {
-      console.log('received: %s', message);
-    });
-  });
-}
 
 export async function getQR(sessionId) {
   const sid = normalizeSessionId(sessionId);
@@ -85,24 +75,21 @@ export async function startSession(sessionId) {
       browser: ["Chrome", "Linux", "120.0.0"],
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      logger: pino({ level: 'info' })
     });
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      console.log(`[${sid}] Connection update: ${connection}`);
+      console.log(`Connection update for ${sid}:`, {
+        connection,
+        qr: qr ? "QR received" : "No QR",
+      });
 
       if (qr) {
         try {
           const qrString = await QRCode.toDataURL(qr);
           qrCodes[sid] = qrString;
           console.log(`QR Code generated for session: ${sid}`);
-          if (wss) {
-            wss.clients.forEach(client => {
-              if (client.readyState === 1) { // 1 = WebSocket.OPEN
-                client.send(JSON.stringify({ type: 'qr', session: sid, qr: qrString }));
-              }
-            });
-          }
         } catch (qrError) {
           console.error(`QR generation failed for ${sid}:`, qrError);
         }
@@ -112,13 +99,13 @@ export async function startSession(sessionId) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const deviceRemoved = statusCode === 401; // stream:error conflict/device_removed
         const loggedOut = statusCode === DisconnectReason.loggedOut;
-        console.log(`[${sid}] Connection closed. Status: ${statusCode}, Logged Out: ${loggedOut}, Device Removed: ${deviceRemoved}`);
+        console.log(`Connection closed for ${sid} (status: ${statusCode})`);
 
         try {
           if (deviceRemoved || loggedOut) {
             if (fs.existsSync(authPath)) {
               fs.rmSync(authPath, { recursive: true, force: true });
-              console.log(`[${sid}] Cleared session directory due to logout or device removal.`);
+              console.log(`Cleared session directory for ${sid}`);
             }
             delete sessions[sid];
             delete qrCodes[sid];
@@ -133,16 +120,9 @@ export async function startSession(sessionId) {
         const delay = deviceRemoved || loggedOut ? 5000 : 1500;
         setTimeout(() => startSession(sid), delay);
       } else if (connection === "open") {
-        console.log(`[${sid}] WhatsApp session connected successfully.`);
+        console.log(`WhatsApp session ${sid} connected`);
         delete qrCodes[sid];
         backoffUntil.delete(sid);
-        if (wss) {
-            wss.clients.forEach(client => {
-                if (client.readyState === 1) { // 1 = WebSocket.OPEN
-                    client.send(JSON.stringify({ type: 'status', session: sid, status: 'connected' }));
-                }
-            });
-        }
       }
     });
 
@@ -189,14 +169,12 @@ export async function sendMessage(sessionId, to, message) {
   const sid = normalizeSessionId(sessionId);
   const sock = sessions[sid];
   if (!sock) {
-    console.error(`[${sid}] Session not found for sendMessage.`);
     throw new Error("Session not found. Please scan QR code first.");
   }
   try {
     const phoneNumber = to.includes("@") ? to : `${to}@s.whatsapp.net`;
-    console.log(`[${sid}] Sending message to ${phoneNumber}`);
     const result = await sock.sendMessage(phoneNumber, { text: message });
-    console.log(`[${sid}] Message sent successfully to ${to}. Message ID: ${result.key.id}`);
+    console.log(`Message sent to ${to}: ${message}`);
     return {
       success: true,
       messageId: result.key.id,
@@ -205,7 +183,7 @@ export async function sendMessage(sessionId, to, message) {
       timestamp: new Date().toISOString(),
     };
   } catch (error) {
-    console.error(`[${sid}] Failed to send message to ${to}:`, error);
+    console.error(`Failed to send message to ${to}:`, error);
     throw new Error(`Failed to send message: ${error.message}`);
   }
 }
