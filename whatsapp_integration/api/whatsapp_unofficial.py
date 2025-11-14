@@ -4,6 +4,9 @@ import requests
 import frappe
 from whatsapp_integration.api.utils import mark_device_active, resolve_device_name
 
+NODE_CONNECT_TIMEOUT = int(os.getenv("WHATSAPP_NODE_CONNECT_TIMEOUT", "10"))
+NODE_READ_TIMEOUT = int(os.getenv("WHATSAPP_NODE_READ_TIMEOUT", "60"))
+
 logger = logging.getLogger(__name__)
 
 def _get_node_base_url():
@@ -137,7 +140,18 @@ def send_unofficial(number, message, session_id=None):
 
         base = "http://127.0.0.1:8001"
         payload = {"session": session_to_use, "to": number, "message": message}
-        resp = requests.post(f"{base}/sendMessage", json=payload, timeout=20)
+        try:
+            resp = requests.post(
+                f"{base}/sendMessage",
+                json=payload,
+                timeout=(NODE_CONNECT_TIMEOUT, NODE_READ_TIMEOUT),
+            )
+        except requests.Timeout:
+            raise Exception(
+                "Node WhatsApp service did not respond in time. "
+                "Verify the Node server is running on 127.0.0.1:8001, the session is connected, "
+                "and increase WHATSAPP_NODE_READ_TIMEOUT if large messages are expected."
+            )
         if resp.status_code != 200:
             raise Exception(f"Node send error: HTTP {resp.status_code} {resp.text}")
         data = resp.json()
