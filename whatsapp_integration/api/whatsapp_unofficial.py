@@ -14,7 +14,8 @@ def _get_node_base_url():
             return node_url.rstrip("/")
     except Exception:
         pass
-    return "http://localhost:8001"
+    # Use explicit loopback IP instead of hostname to avoid Docker/host resolution issues
+    return "http://127.0.0.1:8001"
 
 def _pick_connected_device():
     device = frappe.get_list(
