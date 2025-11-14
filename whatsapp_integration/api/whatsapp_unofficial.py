@@ -135,7 +135,7 @@ def send_unofficial(number, message, session_id=None):
             session_to_use = device["number"]
             device_name = device["name"]
 
-        base = _get_node_base_url()
+        base = "http://127.0.0.1:8001"
         payload = {"session": session_to_use, "to": number, "message": message}
         resp = requests.post(f"{base}/sendMessage", json=payload, timeout=20)
         if resp.status_code != 200:
