@@ -1,7 +1,10 @@
+import logging
 import os
 import requests
 import frappe
 from whatsapp_integration.api.utils import mark_device_active, resolve_device_name
+
+logger = logging.getLogger(__name__)
 
 def _get_node_base_url():
     env_url = os.getenv("WHATSAPP_NODE_URL")
@@ -17,6 +20,39 @@ def _get_node_base_url():
     # Use explicit loopback IP instead of hostname to avoid Docker/host resolution issues
     return "http://127.0.0.1:8001"
 
+def _fetch_node_session_status(session_id):
+    """Return (status, error) for a Node session."""
+    if not session_id:
+        return None, "missing_session"
+
+    base = _get_node_base_url()
+    try:
+        resp = requests.get(f"{base}/status/{session_id}", timeout=10)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        data = resp.json() if resp.content else {}
+        status = (data.get("status") or "").strip()
+        return status, None
+    except Exception as exc:
+        logger.warning("Failed to fetch Node status for session %s: %s", session_id, exc)
+        return None, str(exc)
+
+def _fetch_live_sessions():
+    """Return (sessions, error) from the Node service."""
+    base = _get_node_base_url()
+    try:
+        resp = requests.get(f"{base}/sessions", timeout=10)
+        if resp.status_code != 200:
+            return [], f"HTTP {resp.status_code}"
+        data = resp.json() if resp.content else {}
+        sessions = data.get("sessions") or []
+        if not isinstance(sessions, list):
+            return [], "invalid_sessions_payload"
+        return sessions, None
+    except Exception as exc:
+        logger.warning("Failed to fetch Node sessions: %s", exc)
+        return [], str(exc)
+
 def _pick_connected_device():
     device = frappe.get_list(
         "WhatsApp Device",
@@ -24,7 +60,37 @@ def _pick_connected_device():
         fields=["name", "number"],
         limit=1,
     )
-    return device[0] if device else None
+    if device:
+        return device[0]
+
+    sessions, _ = _fetch_live_sessions()
+    for session in sessions:
+        if (session.get("status") or "").lower() != "connected":
+            continue
+        session_id = session.get("session")
+        device_name = resolve_device_name(session_id)
+        if not device_name:
+            continue
+        number = frappe.db.get_value("WhatsApp Device", device_name, "number") or session_id
+        mark_device_active(device_name, status="Connected")
+        return {"name": device_name, "number": number}
+
+    return None
+
+def _normalize_status(value):
+    return (value or "").strip().lower()
+
+def _session_not_ready_message(session_label, node_status):
+    status = _normalize_status(node_status)
+    if status in {"waiting for scan", "waiting"}:
+        return f"Session '{session_label}' is waiting for a QR scan. Open the WhatsApp Device record and scan the code again."
+    if status in {"connecting"}:
+        return f"Session '{session_label}' is still connecting. Please wait a few seconds and retry."
+    if status in {"disconnected"}:
+        return f"Session '{session_label}' is disconnected. Reset the session and scan the QR again."
+    if node_status:
+        return f"Session '{session_label}' is reported as '{node_status}'. Please re-link the device."
+    return f"Session '{session_label}' is not connected. Please scan the QR code again."
 
 def send_unofficial(number, message, session_id=None):
     """Send message via Node.js WhatsApp service using a connected device session.
@@ -39,10 +105,21 @@ def send_unofficial(number, message, session_id=None):
             device_name = resolve_device_name(session_id)
             if not device_name:
                 raise Exception(f"Requested session '{session_id}' was not found.")
+            session_to_use = frappe.db.get_value("WhatsApp Device", device_name, "number") or session_id
             device_status = frappe.db.get_value("WhatsApp Device", device_name, "status")
             if device_status != "Connected":
-                raise Exception(f"Session '{session_id}' is not connected. Please scan the QR code again.")
-            session_to_use = frappe.db.get_value("WhatsApp Device", device_name, "number") or session_id
+                node_status, status_error = _fetch_node_session_status(session_to_use)
+                normalized = _normalize_status(node_status)
+                if normalized == "connected":
+                    mark_device_active(device_name, status="Connected")
+                elif node_status:
+                    raise Exception(_session_not_ready_message(session_id, node_status))
+                elif status_error:
+                    logger.warning(
+                        "Unable to verify Node status for session %s (%s). Proceeding with send attempt.",
+                        session_id,
+                        status_error,
+                    )
         else:
             device = _pick_connected_device()
             if not device:
@@ -81,12 +158,10 @@ def send_unofficial(number, message, session_id=None):
 def check_device_status(session_id):
     """Check if WhatsApp device is connected using Node service"""
     try:
-        base = _get_node_base_url()
-        resp = requests.get(f"{base}/status/{session_id}", timeout=10)
-        if resp.status_code != 200:
-            return {"status": "Error", "message": f"HTTP {resp.status_code}"}
-        data = resp.json()
-        return {"status": data.get("status", "Unknown")}
+        status, error = _fetch_node_session_status(session_id)
+        if status:
+            return {"status": status}
+        return {"status": "Error", "message": error or "Unknown status"}
     except Exception as e:
         frappe.log_error(f"Status check error (Node): {str(e)}", "WhatsApp Status Check")
         return {"status": "Error", "message": str(e)}

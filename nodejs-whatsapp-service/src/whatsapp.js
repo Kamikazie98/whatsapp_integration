@@ -22,6 +22,7 @@ function normalizeSessionId(id) {
 
 let sessions = {};
 let qrCodes = {};
+const readySessions = new Set(); // sessions with established WhatsApp connection
 const starting = new Set(); // prevent concurrent startSession per sid
 const backoffUntil = new Map(); // sid -> timestamp ms when next attempt is allowed
 
@@ -101,6 +102,8 @@ export async function startSession(sessionId) {
         const loggedOut = statusCode === DisconnectReason.loggedOut;
         console.log(`Connection closed for ${sid} (status: ${statusCode})`);
 
+        readySessions.delete(sid);
+
         const removed = deviceRemoved || loggedOut;
         try {
           if (removed) {
@@ -128,6 +131,7 @@ export async function startSession(sessionId) {
         console.log(`WhatsApp session ${sid} connected`);
         delete qrCodes[sid];
         backoffUntil.delete(sid);
+        readySessions.add(sid);
       }
     });
 
@@ -176,6 +180,9 @@ export async function sendMessage(sessionId, to, message) {
   if (!sock) {
     throw new Error("Session not found. Please scan QR code first.");
   }
+  if (!readySessions.has(sid)) {
+    throw new Error("Session is not connected yet. Please wait for the device to come online.");
+  }
   try {
     const phoneNumber = to.includes("@") ? to : `${to}@s.whatsapp.net`;
     const result = await sock.sendMessage(phoneNumber, { text: message });
@@ -196,13 +203,16 @@ export async function sendMessage(sessionId, to, message) {
 
 export function getSessionStatus(sessionId) {
   const sid = normalizeSessionId(sessionId);
-  if (sessions[sid]) {
+  if (readySessions.has(sid)) {
     return "Connected";
-  } else if (qrCodes[sid]) {
-    return "Waiting for scan";
-  } else {
-    return "Disconnected";
   }
+  if (qrCodes[sid]) {
+    return "Waiting for scan";
+  }
+  if (sessions[sid]) {
+    return "Connecting";
+  }
+  return "Disconnected";
 }
 
 export function listSessions() {
@@ -219,6 +229,7 @@ export function resetSession(sessionId) {
     }
     delete sessions[sid];
     delete qrCodes[sid];
+    readySessions.delete(sid);
     return { success: true };
   } catch (e) {
     return { success: false, error: String(e) };
