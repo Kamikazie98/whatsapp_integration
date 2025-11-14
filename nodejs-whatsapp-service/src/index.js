@@ -1,9 +1,23 @@
 import 'dotenv/config';
 import * as nodeCrypto from 'crypto';
-if (!globalThis.crypto || !('hkdfSync' in globalThis.crypto)) {
-  // @ts-ignore
-  globalThis.crypto = nodeCrypto;
+
+const cryptoImpl =
+  globalThis.crypto ??
+  nodeCrypto.webcrypto ??
+  nodeCrypto;
+
+if (!globalThis.crypto) {
+  // Older Node versions expose no global crypto; safe to assign
+  // eslint-disable-next-line no-global-assign
+  globalThis.crypto = cryptoImpl;
+} else if (!('hkdfSync' in globalThis.crypto) && typeof nodeCrypto.hkdfSync === 'function') {
+  // Node 20+ exposes read-only global crypto; augment it with hkdfSync if missing
+  Object.defineProperty(globalThis.crypto, 'hkdfSync', {
+    value: nodeCrypto.hkdfSync.bind(nodeCrypto),
+    configurable: true,
+  });
 }
+
 import express from 'express';
 import bodyParser from 'body-parser';
 import { startSession, sendMessage, getQR, getSessionStatus, listSessions, resetSession } from './engine.js';
