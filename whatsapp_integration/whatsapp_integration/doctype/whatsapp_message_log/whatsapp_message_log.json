@@ -8,6 +8,7 @@
  "field_order": [
   "naming_series",
   "number",
+  "device",
   "message",
   "direction",
   "status",
@@ -28,6 +29,13 @@
    "in_list_view": 1,
    "label": "Phone Number",
    "reqd": 1
+  },
+  {
+   "fieldname": "device",
+   "fieldtype": "Link",
+   "label": "Session / Device",
+   "options": "WhatsApp Device",
+   "in_list_view": 1
   },
   {
    "fieldname": "message",

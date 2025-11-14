@@ -1,4 +1,6 @@
 import frappe
+from frappe.utils import now
+from whatsapp_integration.api.utils import mark_device_active, resolve_device_name
 
 @frappe.whitelist(allow_guest=True)
 def receive_message():
@@ -22,22 +24,52 @@ def receive_message():
                 for change in entry.get("changes", []):
                     messages = change["value"].get("messages", [])
                     for msg in messages:
-                        frappe.get_doc({
-                            "doctype": "WhatsApp Message Log",
-                            "number": msg["from"],
-                            "message": msg["text"]["body"],
-                            "direction": "In",
-                            "status": "Received"
-                        }).insert(ignore_permissions=True)
+                        number = msg.get("from")
+                        text = (msg.get("text") or {}).get("body") or ""
+                        timestamp = msg.get("timestamp")
+                        device_name = _log_incoming_message(number, text, timestamp=timestamp)
+                        _publish_incoming_notification(None, number, text, device_name, timestamp)
 
         else:
             # Unofficial webhook payload
-            frappe.get_doc({
-                "doctype": "WhatsApp Message Log",
-                "number": data.get("from"),
-                "message": data.get("text"),
-                "direction": "In",
-                "status": "Received"
-            }).insert(ignore_permissions=True)
+            number = data.get("from")
+            text = data.get("text") or ""
+            session_id = data.get("session")
+            timestamp = data.get("timestamp")
+            device_name = _log_incoming_message(number, text, session_id=session_id, timestamp=timestamp)
+            _publish_incoming_notification(session_id, number, text, device_name, timestamp)
 
         return {"status": "ok"}
+
+def _log_incoming_message(number, message, session_id=None, timestamp=None):
+    device_name = resolve_device_name(session_id)
+    frappe.get_doc({
+        "doctype": "WhatsApp Message Log",
+        "number": number,
+        "message": message,
+        "direction": "In",
+        "status": "Received",
+        "device": device_name,
+        "sent_time": timestamp or now()
+    }).insert(ignore_permissions=True)
+
+    if device_name:
+        mark_device_active(device_name, status="Connected")
+
+    return device_name
+
+def _publish_incoming_notification(session_id, number, message, device_name, timestamp):
+    payload = {
+        "session": session_id,
+        "device": device_name,
+        "number": number,
+        "message": message,
+        "timestamp": timestamp or now()
+    }
+    frappe.publish_realtime(
+        "whatsapp_incoming_message",
+        payload,
+        doctype="WhatsApp Device",
+        docname=device_name or session_id or "WhatsApp Device",
+        after_commit=True,
+    )

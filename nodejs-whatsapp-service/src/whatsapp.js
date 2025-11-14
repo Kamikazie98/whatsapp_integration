@@ -182,6 +182,7 @@ export async function sendMessage(sessionId, to, message) {
     console.log(`Message sent to ${to}: ${message}`);
     return {
       success: true,
+      session: sid,
       messageId: result.key.id,
       to: to,
       message: message,

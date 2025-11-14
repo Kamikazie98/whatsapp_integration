@@ -95,7 +95,7 @@ export async function sendMessage(sessionId, to, message) {
   if (!client || !ready.has(sid)) throw new Error('Session not found. Please scan QR code first.');
   const jid = to.includes('@') ? to : `${to}@c.us`;
   const res = await client.sendMessage(jid, message);
-  return { success: true, messageId: res.id.id, to, message, timestamp: new Date().toISOString() };
+  return { success: true, session: sid, messageId: res.id.id, to, message, timestamp: new Date().toISOString() };
 }
 
 export function getSessionStatus(sessionId) {

@@ -22,52 +22,74 @@ frappe.ui.form.on('WhatsApp Dashboard', {
         // Quick Actions Panel
         frm.dashboard.add_section('<h3>Quick Actions</h3>');
 
-        frm.add_custom_button(__('➕ Add Device'), function() {
-            frappe.call({
-                method: "whatsapp_integration.api.dashboard_actions.add_device",
-                args: { session_name: "default" },
-                callback: function(r) {
-                    if(r.message.qr) {
-                        frappe.msgprint(__('Scan this QR in WhatsApp App'));
-                        frappe.show_alert({ message: "Device Added, Scan QR", indicator: 'green' });
-                    }
-                }
-            });
-        }, __("Quick Actions"));
-
-        frm.add_custom_button(__('✉️ Send Test Message'), function() {
+        frm.add_custom_button(__('Add Device'), function() {
             frappe.prompt(
-                [{fieldtype:'Data', label:'WhatsApp Number (with country code)', fieldname:'number', reqd:1}],
+                [{
+                    fieldtype:'Data',
+                    label: __('Session Name'),
+                    fieldname:'session_name',
+                    reqd:1,
+                    default: 'default',
+                    description: __('Letters, numbers, dash or underscore.')
+                }],
                 function(values){
                     frappe.call({
-                        method: "whatsapp_integration.api.dashboard_actions.send_test_message",
-                        args: { number: values.number },
+                        method: "whatsapp_integration.api.dashboard_actions.add_device",
+                        args: { session_name: values.session_name },
                         callback: function(r) {
-                            frappe.show_alert({ message: "Test message sent", indicator: 'green' });
+                            if (r.message && r.message.error) {
+                                frappe.msgprint(r.message.error);
+                                return;
+                            }
+                            if (r.message && r.message.qr) {
+                                frappe.msgprint(__('Scan this QR in WhatsApp App for session {0}', [values.session_name]));
+                            }
+                            frappe.show_alert({ message: __("Device request sent for session {0}", [values.session_name]), indicator: 'green' });
+                            frm.reload_doc();
                         }
                     });
                 },
-                __("Send Test Message"),
-                __("Send")
+                __('Add Device Session'),
+                __('Generate')
             );
-        }, __("Quick Actions"));
+        }, __('Quick Actions'));
 
-        frm.add_custom_button(__('🔄 Sync Now'), function() {
+        frm.add_custom_button(__('Send Test Message'), function() {
+            frappe.prompt(
+                [
+                    {fieldtype:'Link', label:__('Session (optional)'), options:'WhatsApp Device', fieldname:'session'},
+                    {fieldtype:'Data', label:__('WhatsApp Number (with country code)'), fieldname:'number', reqd:1}
+                ],
+                function(values){
+                    frappe.call({
+                        method: "whatsapp_integration.api.dashboard_actions.send_test_message",
+                        args: { number: values.number, session: values.session },
+                        callback: function() {
+                            frappe.show_alert({ message: __('Test message queued'), indicator: 'green' });
+                        }
+                    });
+                },
+                __('Send Test Message'),
+                __('Send')
+            );
+        }, __('Quick Actions'));
+
+        frm.add_custom_button(__('Sync Now'), function() {
             frappe.call({
                 method: "whatsapp_integration.api.dashboard_actions.sync_now",
-                callback: function(r) {
+                callback: function() {
                     frappe.show_alert({ message: "Dashboard synced", indicator: 'blue' });
                     frm.reload_doc();
                 }
             });
-        }, __("Quick Actions"));
+        }, __('Quick Actions'));
 
         // Campaigns
-        frm.add_custom_button(__('📢 New Campaign'), function() {
+        frm.add_custom_button(__('New Campaign'), function() {
             frappe.new_doc('WhatsApp Campaign');
-        }, __("Campaigns"));
+        }, __('Campaigns'));
 
-        frm.add_custom_button(__('▶️ Run Campaign'), function() {
+        frm.add_custom_button(__('Run Campaign'), function() {
             frappe.prompt(
                 [{fieldtype:'Link', label:'Campaign', options:'WhatsApp Campaign', fieldname:'campaign', reqd:1}],
                 function(values){
@@ -79,10 +101,10 @@ frappe.ui.form.on('WhatsApp Dashboard', {
                         }
                     });
                 },
-                __("Run WhatsApp Campaign"),
-                __("Run")
+                __('Run WhatsApp Campaign'),
+                __('Run')
             );
-        }, __("Campaigns"));
+        }, __('Campaigns'));
 
         // Charts
         if(frm.doc.messages_trend) {

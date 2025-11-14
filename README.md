@@ -59,6 +59,13 @@ bench start
 - Click "Generate QR Code" and scan with WhatsApp mobile app
 - Follow on-screen instructions for linking and troubleshooting
 
+## Session-aware messaging
+- Each WhatsApp Device now represents a selectable session. Choose the device when sending single messages (`whatsapp_integration.api.whatsapp.send_whatsapp_message(number, message, session="My Device")`) or when configuring a WhatsApp Campaign (`WhatsApp Device / Session` field).
+- Incoming and outgoing messages store the originating session in the WhatsApp Message Log so you can filter conversations per device.
+- The dashboard quick actions let you pick a session when sending test pings or when creating a new device/QR session.
+- A realtime event `whatsapp_incoming_message` is published whenever a message arrives so you can subscribe in custom Desk scripts:  
+  `frappe.realtime.on("whatsapp_incoming_message", (payload) => console.log(payload.session, payload.number, payload.message));`
+
 ## Troubleshooting
 - If you see "Can't link new devices at this time", wait 2-5 minutes and try again
 - Remove old linked devices from WhatsApp mobile app
