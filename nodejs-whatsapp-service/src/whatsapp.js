@@ -197,7 +197,28 @@ export async function sendMessage(sessionId, to, message) {
     };
   } catch (error) {
     console.error(`Failed to send message to ${to}:`, error);
-    throw new Error(`Failed to send message: ${error.message}`);
+    const timedOut =
+      /timed\s*out/i.test(error?.message || "") ||
+      error?.output?.statusCode === 408 ||
+      error?.data?.statusCode === 408;
+    if (timedOut) {
+      readySessions.delete(sid);
+      if (sessions[sid]) {
+        try {
+          sessions[sid].end?.(new Error("Restarting after send timeout"));
+        } catch (e) {
+          console.warn("Failed ending socket cleanly:", e);
+        }
+        delete sessions[sid];
+      }
+      setTimeout(() => startSession(sid).catch((reconnectErr) => {
+        console.error(`Auto-reconnect failed for ${sid}:`, reconnectErr);
+      }), 2000);
+      throw new Error(
+        "WhatsApp session timed out while sending. Node service is reconnecting; please retry in a few seconds."
+      );
+    }
+    throw new Error(`Failed to send message: ${error.message || String(error)}`);
   }
 }
 
