@@ -6,10 +6,17 @@ if (!globalThis.crypto || !('hkdfSync' in globalThis.crypto)) {
 }
 import express from 'express';
 import bodyParser from 'body-parser';
-import { startSession, sendMessage, getQR, getSessionStatus, listSessions, resetSession } from './engine.js';
+import { startSession, sendMessage, getQR, getSessionStatus, listSessions, resetSession, setWebSocketServer } from './engine.js';
 import config from './config.js';
+import { WebSocketServer } from 'ws';
+import http from 'http';
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+setWebSocketServer(wss);
+
 app.use(bodyParser.json());
 
 app.get('/', (_req, res) => {
@@ -63,8 +70,8 @@ app.get('/sessions', (_req, res) => {
 });
 
 const PORT = config.port;
-app.listen(PORT, () => {
-  console.log(`WhatsApp API Service running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`WhatsApp API and WebSocket Service running on port ${PORT}`);
   console.log(`Base URL: ${config.base_url}`);
   console.log(`QR endpoint: ${config.base_url}/qr/default`);
   console.log(`Send message: POST ${config.base_url}/sendMessage`);

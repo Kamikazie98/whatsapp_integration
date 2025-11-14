@@ -157,7 +157,7 @@ frappe.ui.form.on('WhatsApp Device', {
         
         // Auto-refresh for QR Generated devices
         if (frm.doc.status === 'QR Generated' && !frm.doc.__islocal) {
-            setup_auto_refresh(frm);
+            setup_websocket(frm);
         }
     }
 });
@@ -262,37 +262,9 @@ function show_qr_dialog(qr_data, device_number, frm) {
     });
     dialog.show();
 
-    // Poll latest QR (rotates on WhatsApp Web) and connection status while dialog is open
-    const pollIntervalMs = 8000; // 8s
-    const poll = () => {
-        if (!frm || frm.is_new()) return;
-        frm.call('get_live_qr').then(r => {
-            const msg = r && r.message;
-            if (msg && msg.status === 'qr_generated' && msg.qr) {
-                const imgEl = dialog.$wrapper.find('#qr-container img')[0];
-                if (imgEl) { imgEl.src = msg.qr; }
-            }
-        }).catch(() => {});
-        frm.call('check_node_status').then(r => {
-            if (r && r.message && r.message.status === 'connected') {
-                clearInterval(dialog.__qr_timer);
-                frappe.msgprint({
-                    title: __('Connected'),
-                    message: __('WhatsApp device is now connected.'),
-                    indicator: 'green'
-                });
-                dialog.hide();
-                frm.reload_doc();
-            }
-        }).catch(() => {});
-    };
-    dialog.__qr_timer = setInterval(poll, pollIntervalMs);
     // Clean up when dialog closes
     dialog.$wrapper.on('hidden.bs.modal', () => {
-        if (dialog.__qr_timer) {
-            clearInterval(dialog.__qr_timer);
-            dialog.__qr_timer = null;
-        }
+        // No timer to clean up
     });
 }
 
@@ -355,31 +327,58 @@ function display_qr_inline(frm) {
     $(frm.fields_dict.qr_code.wrapper).after(qr_html);
 }
 
-function setup_auto_refresh(frm) {
-    // Auto-refresh every 12 seconds for QR Generated devices
-    if (frm.auto_refresh_timer) {
-        clearInterval(frm.auto_refresh_timer);
-    }
-    
-    frm.auto_refresh_timer = setInterval(function() {
-        if (frm.doc.status === 'QR Generated') {
-            // Pull latest QR and status via server (avoids CORS to Node)
-            frm.call('get_live_qr');
-            frm.call('check_node_status').then(r => {
-                if (r.message && r.message.status === 'connected') {
-                    clearInterval(frm.auto_refresh_timer);
-                    frm.reload_doc();
-                }
-            });
-        } else {
-            clearInterval(frm.auto_refresh_timer);
-        }
-    }, 12000); // Check every 12 seconds
-}
-
 // Clean up timer when form is destroyed
 $(document).on('page-change', function() {
     if (cur_frm && cur_frm.auto_refresh_timer) {
         clearInterval(cur_frm.auto_refresh_timer);
     }
+    if (window.whatsapp_ws) {
+        window.whatsapp_ws.close();
+    }
 });
+
+function setup_websocket(frm) {
+    if (window.whatsapp_ws && window.whatsapp_ws.readyState === WebSocket.OPEN) {
+        return;
+    }
+
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const port = frappe.boot.socketio_port || 8001;
+    const url = `${proto}//${window.location.hostname}:${port}`;
+
+    window.whatsapp_ws = new WebSocket(url);
+
+    window.whatsapp_ws.onopen = function() {
+        console.log('WhatsApp WebSocket connection established');
+    };
+
+    window.whatsapp_ws.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        if (data.type === 'qr' && data.session === frm.doc.number) {
+            console.log('New QR code received via WebSocket');
+            frm.set_value('qr_code', data.qr);
+            if (cur_dialog && cur_dialog.title.includes('WhatsApp QR Code')) {
+                const imgEl = cur_dialog.$wrapper.find('#qr-container img')[0];
+                if (imgEl) {
+                    imgEl.src = data.qr;
+                }
+            }
+        } else if (data.type === 'status' && data.session === frm.doc.number) {
+            console.log('Status update received via WebSocket:', data.status);
+            if (data.status === 'connected') {
+                frm.set_value('status', 'Connected');
+                frm.reload_doc();
+            } else {
+                frm.set_value('status', 'Disconnected');
+            }
+        }
+    };
+
+    window.whatsapp_ws.onclose = function() {
+        console.log('WhatsApp WebSocket connection closed');
+    };
+
+    window.whatsapp_ws.onerror = function(error) {
+        console.error('WhatsApp WebSocket error:', error);
+    };
+}

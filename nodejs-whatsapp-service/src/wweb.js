@@ -10,6 +10,17 @@ import config from './config.js';
 const sessions = new Map(); // sid -> Client
 const qrCodes = new Map(); // sid -> dataURL
 const ready = new Set(); // sid
+let wss;
+
+export function setWebSocketServer(wsServer) {
+  wss = wsServer;
+  wss.on('connection', ws => {
+    console.log('WebSocket client connected');
+    ws.on('message', message => {
+      console.log('received: %s', message);
+    });
+  });
+}
 
 const sessionRoot = path.isAbsolute(config.session_path)
   ? config.session_path
@@ -51,6 +62,13 @@ export async function startSession(sessionId) {
       const dataUrl = await QRCode.toDataURL(qr);
       qrCodes.set(sid, dataUrl);
       console.log(`WWebJS QR generated for ${sid}`);
+      if (wss) {
+        wss.clients.forEach(client => {
+          if (client.readyState === 1) { // 1 = WebSocket.OPEN
+            client.send(JSON.stringify({ type: 'qr', session: sid, qr: dataUrl }));
+          }
+        });
+      }
     } catch (e) {
       console.error('Failed to render QR', e);
     }
@@ -59,11 +77,18 @@ export async function startSession(sessionId) {
   client.on('ready', () => {
     ready.add(sid);
     qrCodes.delete(sid);
-    console.log(`WWebJS session ${sid} ready`);
+    console.log(`[${sid}] WWebJS session ready.`);
+    if (wss) {
+        wss.clients.forEach(client => {
+            if (client.readyState === 1) { // 1 = WebSocket.OPEN
+                client.send(JSON.stringify({ type: 'status', session: sid, status: 'connected' }));
+            }
+        });
+    }
   });
 
   client.on('disconnected', async (reason) => {
-    console.warn(`WWebJS session ${sid} disconnected: ${reason}`);
+    console.warn(`[${sid}] WWebJS session disconnected: ${reason}`);
     ready.delete(sid);
     sessions.delete(sid);
     // Do not auto-delete auth; allow manual reset via API
@@ -92,10 +117,20 @@ export async function startSession(sessionId) {
 export async function sendMessage(sessionId, to, message) {
   const sid = normalizeSessionId(sessionId);
   const client = sessions.get(sid);
-  if (!client || !ready.has(sid)) throw new Error('Session not found. Please scan QR code first.');
-  const jid = to.includes('@') ? to : `${to}@c.us`;
-  const res = await client.sendMessage(jid, message);
-  return { success: true, messageId: res.id.id, to, message, timestamp: new Date().toISOString() };
+  if (!client || !ready.has(sid)) {
+    console.error(`[${sid}] Session not found or not ready for sendMessage.`);
+    throw new Error('Session not found. Please scan QR code first.');
+  }
+  try {
+    const jid = to.includes('@') ? to : `${to}@c.us`;
+    console.log(`[${sid}] Sending message to ${jid}`);
+    const res = await client.sendMessage(jid, message);
+    console.log(`[${sid}] Message sent successfully to ${to}. Message ID: ${res.id.id}`);
+    return { success: true, messageId: res.id.id, to, message, timestamp: new Date().toISOString() };
+  } catch (error) {
+    console.error(`[${sid}] Failed to send message to ${to}:`, error);
+    throw new Error(`Failed to send message: ${error.message}`);
+  }
 }
 
 export function getSessionStatus(sessionId) {
