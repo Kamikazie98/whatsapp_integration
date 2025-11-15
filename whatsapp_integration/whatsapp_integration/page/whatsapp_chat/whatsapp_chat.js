@@ -193,6 +193,12 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 			return value.replace(/@.+$/, "");
 		}
 
+		normalize_session_id(value) {
+			const raw = (value == null ? "default" : String(value)).trim();
+			const cleaned = raw.replace(/[^0-9A-Za-z_\-]/g, "");
+			return cleaned || "default";
+		}
+
 		listen_realtime() {
 			frappe.realtime.on("whatsapp_incoming_message", (payload) => {
 				if (!payload || !payload.number) return;
@@ -377,10 +383,10 @@ subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
         return;
     }
 
-    const normalizedSession = session || "default";
-    const baseJid = (jid || "").toLowerCase();
-    const normalizedJid = baseJid.includes("@") ? baseJid : `${baseJid}@s.whatsapp.net`;
-    const key = `${normalizedSession}::${normalizedJid}`;
+			const normalizedSession = this.normalize_session_id(session);
+			const baseJid = (jid || "").toLowerCase();
+			const normalizedJid = baseJid.includes("@") ? baseJid : `${baseJid}@s.whatsapp.net`;
+			const key = `${normalizedSession}::${normalizedJid}`;
 
     console.log("[WA-WS] درخواست subscribe", {
         session,
@@ -451,7 +457,8 @@ subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
 		}
 
 		handle_ws_history(payload) {
-			const key = `${(payload.session || "default")}::${(payload.jid || "").toLowerCase()}`;
+			const payloadSession = this.normalize_session_id(payload.session || "default");
+			const key = `${payloadSession}::${(payload.jid || "").toLowerCase()}`;
 			if (key !== this.currentSubscriptionKey) return;
 			this.awaitingHistory = false;
 			clearTimeout(this.historyFallbackTimer);
@@ -470,7 +477,8 @@ subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
 		}
 
 		handle_ws_live_message(payload) {
-			const key = `${(payload.session || "default")}::${(payload.jid || "").toLowerCase()}`;
+			const payloadSession = this.normalize_session_id(payload.session || "default");
+			const key = `${payloadSession}::${(payload.jid || "").toLowerCase()}`;
 			if (key !== this.currentSubscriptionKey) return;
 			const entries = this.map_ws_messages([payload.message]);
 			if (entries.length) {
