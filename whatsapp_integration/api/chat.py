@@ -227,7 +227,7 @@ def load_whatsapp_chats(session=None):
                 "partyName": party_name,
             })
     
-    return {"success": True, chats: chats}
+    return {"success": True, "chats": chats}
 
 
 @frappe.whitelist()
@@ -291,7 +291,7 @@ def load_whatsapp_contacts(session=None):
                 "partyName": party_name,
             })
     
-    return {"success": True, contacts: contacts}
+    return {"success": True, "contacts": contacts}
 
 
 @frappe.whitelist()

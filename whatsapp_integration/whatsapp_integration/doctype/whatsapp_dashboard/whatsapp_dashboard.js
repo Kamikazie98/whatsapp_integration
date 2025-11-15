@@ -85,7 +85,7 @@ frappe.ui.form.on('WhatsApp Dashboard', {
         }, __('Quick Actions'));
 
         frm.add_custom_button(__('Open Chat'), function() {
-            window.location.href = '/whatsapp-chat';
+            frappe.set_route('page', 'whatsapp-chat');
         }, __('Quick Actions'));
 
         // Campaigns
