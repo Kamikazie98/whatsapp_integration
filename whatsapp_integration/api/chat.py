@@ -2,7 +2,7 @@ import frappe
 from frappe import _
 from frappe.utils import now
 
-from whatsapp_integration.api.utils import mark_device_active, resolve_device_name
+from whatsapp_integration.api.utils import mark_device_active, resolve_device_name, find_party_by_number
 from whatsapp_integration.api.whatsapp_unofficial import send_unofficial
 
 
@@ -41,6 +41,9 @@ def send_chat_message(number, message, session=None):
 
     session_value = (session or "").strip() or None
     device_name = resolve_device_name(session_value)
+    
+    # Auto-detect party type and name based on phone number
+    party_type, party_name = find_party_by_number(number)
 
     log_doc = frappe.get_doc({
         "doctype": "WhatsApp Message Log",
@@ -49,6 +52,8 @@ def send_chat_message(number, message, session=None):
         "direction": "Out",
         "status": "Sending",
         "device": device_name,
+        "party_type": party_type,
+        "party_name": party_name,
     })
     log_doc.insert(ignore_permissions=True)
 
@@ -159,3 +164,162 @@ def get_available_devices(only_connected=False):
         order_by="modified desc",
     )
     return {"devices": devices}
+
+
+@frappe.whitelist()
+def load_whatsapp_chats(session=None):
+    """Load chats from WhatsApp for a specific session."""
+    _ensure_unofficial_mode()
+    
+    import requests
+    from whatsapp_integration.api.whatsapp_unofficial import _get_node_base_url
+    
+    session_value = (session or "").strip() or None
+    device_name = resolve_device_name(session_value)
+    
+    # Use device number as session if available
+    if device_name:
+        session_to_use = frappe.db.get_value("WhatsApp Device", device_name, "number") or session_value or device_name
+    else:
+        session_to_use = session_value or "default"
+    
+    base_url = _get_node_base_url()
+    
+    # Combine groups from WhatsApp and individual chats from database
+    chats = []
+    
+    try:
+        resp = requests.get(f"{base_url}/chats/{session_to_use}", timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success") and data.get("chats"):
+            chats.extend(data.get("chats", []))
+    except Exception as e:
+        frappe.log_error(f"Failed to load WhatsApp groups: {str(e)}", "WhatsApp Load Chats")
+    
+    # Get individual chats from message history (database)
+    filters = {}
+    if device_name:
+        filters["device"] = device_name
+    
+    # Get unique numbers from recent messages
+    recent_chats = frappe.db.sql("""
+        SELECT DISTINCT number, MAX(sent_time) as last_time
+        FROM `tabWhatsApp Message Log`
+        WHERE device = %(device)s OR %(device)s IS NULL
+        GROUP BY number
+        ORDER BY last_time DESC
+        LIMIT 100
+    """, {"device": device_name or ""}, as_dict=True)
+    
+    for chat in recent_chats:
+        # Check if already in groups list
+        if not any(c.get("number") == chat.number for c in chats):
+            party_type, party_name = find_party_by_number(chat.number)
+            chats.append({
+                "id": f"{chat.number}@s.whatsapp.net",
+                "number": chat.number,
+                "name": party_name or chat.number,
+                "isGroup": False,
+                "profilePicture": None,
+                "lastTime": chat.last_time,
+                "partyType": party_type,
+                "partyName": party_name,
+            })
+    
+    return {"success": True, chats: chats}
+
+
+@frappe.whitelist()
+def load_whatsapp_contacts(session=None):
+    """Load contacts from WhatsApp for a specific session."""
+    _ensure_unofficial_mode()
+    
+    import requests
+    from whatsapp_integration.api.whatsapp_unofficial import _get_node_base_url
+    
+    session_value = (session or "").strip() or None
+    device_name = resolve_device_name(session_value)
+    
+    # Use device number as session if available
+    if device_name:
+        session_to_use = frappe.db.get_value("WhatsApp Device", device_name, "number") or session_value or device_name
+    else:
+        session_to_use = session_value or "default"
+    
+    base_url = _get_node_base_url()
+    
+    # Since WhatsApp Web doesn't expose full contact list, use message history
+    contacts = []
+    
+    try:
+        resp = requests.get(f"{base_url}/contacts/{session_to_use}", timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success") and data.get("contacts"):
+            contacts.extend(data.get("contacts", []))
+    except Exception as e:
+        frappe.log_error(f"Failed to load WhatsApp contacts: {str(e)}", "WhatsApp Load Contacts")
+    
+    # Get contacts from message history (database) - exclude groups
+    filters = {}
+    if device_name:
+        filters["device"] = device_name
+    
+    # Get unique numbers from recent messages (individual chats only, not groups)
+    recent_contacts = frappe.db.sql("""
+        SELECT DISTINCT number, MAX(sent_time) as last_time
+        FROM `tabWhatsApp Message Log`
+        WHERE (device = %(device)s OR %(device)s IS NULL)
+        AND number NOT LIKE '%@g.us'
+        GROUP BY number
+        ORDER BY last_time DESC
+        LIMIT 200
+    """, {"device": device_name or ""}, as_dict=True)
+    
+    for contact in recent_contacts:
+        # Check if already in contacts list
+        if not any(c.get("number") == contact.number for c in contacts):
+            party_type, party_name = find_party_by_number(contact.number)
+            contacts.append({
+                "id": f"{contact.number}@s.whatsapp.net",
+                "number": contact.number,
+                "name": party_name or contact.number,
+                "profilePicture": None,
+                "lastTime": contact.last_time,
+                "partyType": party_type,
+                "partyName": party_name,
+            })
+    
+    return {"success": True, contacts: contacts}
+
+
+@frappe.whitelist()
+def load_whatsapp_messages(session=None, jid=None, limit=50):
+    """Load messages from WhatsApp for a specific chat."""
+    _ensure_unofficial_mode()
+    
+    import requests
+    from whatsapp_integration.api.whatsapp_unofficial import _get_node_base_url
+    
+    if not jid:
+        frappe.throw(_("Chat ID (JID) is required."))
+    
+    session_value = (session or "").strip() or None
+    device_name = resolve_device_name(session_value)
+    
+    # Use device number as session if available
+    if device_name:
+        session_to_use = frappe.db.get_value("WhatsApp Device", device_name, "number") or session_value or device_name
+    else:
+        session_to_use = session_value or "default"
+    
+    base_url = _get_node_base_url()
+    try:
+        resp = requests.get(f"{base_url}/messages/{session_to_use}/{jid}?limit={limit}", timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return data
+    except Exception as e:
+        frappe.log_error(f"Failed to load WhatsApp messages: {str(e)}", "WhatsApp Load Messages")
+        frappe.throw(_("Failed to load messages from WhatsApp: {0}").format(str(e)))

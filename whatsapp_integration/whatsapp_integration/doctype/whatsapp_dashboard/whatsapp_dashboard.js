@@ -84,6 +84,10 @@ frappe.ui.form.on('WhatsApp Dashboard', {
             });
         }, __('Quick Actions'));
 
+        frm.add_custom_button(__('Open Chat'), function() {
+            window.location.href = '/whatsapp-chat';
+        }, __('Quick Actions'));
+
         // Campaigns
         frm.add_custom_button(__('New Campaign'), function() {
             frappe.new_doc('WhatsApp Campaign');

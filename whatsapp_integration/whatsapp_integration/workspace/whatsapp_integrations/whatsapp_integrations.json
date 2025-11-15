@@ -57,6 +57,12 @@
    "type": "DocType"
   },
   {
+   "color": "Blue",
+   "label": "WhatsApp Chat",
+   "link_to": "whatsapp-chat",
+   "type": "Page"
+  },
+  {
    "color": "Grey",
    "doc_view": "List",
    "label": "WhatsApp Settings",

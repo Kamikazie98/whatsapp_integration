@@ -1,6 +1,6 @@
 import frappe
 from frappe.utils import now
-from whatsapp_integration.api.utils import mark_device_active, resolve_device_name
+from whatsapp_integration.api.utils import mark_device_active, resolve_device_name, find_party_by_number
 
 @frappe.whitelist(allow_guest=True)
 def receive_message():
@@ -43,15 +43,22 @@ def receive_message():
 
 def _log_incoming_message(number, message, session_id=None, timestamp=None):
     device_name = resolve_device_name(session_id)
-    frappe.get_doc({
+    
+    # Auto-detect party type and name based on phone number
+    party_type, party_name = find_party_by_number(number)
+    
+    log_doc = frappe.get_doc({
         "doctype": "WhatsApp Message Log",
         "number": number,
         "message": message,
         "direction": "In",
         "status": "Received",
         "device": device_name,
+        "party_type": party_type,
+        "party_name": party_name,
         "sent_time": timestamp or now()
-    }).insert(ignore_permissions=True)
+    })
+    log_doc.insert(ignore_permissions=True)
 
     if device_name:
         mark_device_active(device_name, status="Connected")

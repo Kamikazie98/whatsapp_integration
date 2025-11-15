@@ -20,7 +20,7 @@ if (!globalThis.crypto) {
 
 import express from 'express';
 import bodyParser from 'body-parser';
-import { startSession, sendMessage, getQR, getSessionStatus, listSessions, resetSession } from './engine.js';
+import { startSession, sendMessage, getQR, getSessionStatus, listSessions, resetSession, getChats, getContacts, getChatMessages } from './engine.js';
 import config from './config.js';
 
 const app = express();
@@ -71,6 +71,35 @@ app.post('/reset', (req, res) => {
 app.get('/sessions', (_req, res) => {
   try {
     res.json({ sessions: listSessions() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/chats/:session', async (req, res) => {
+  try {
+    const result = await getChats(req.params.session);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/contacts/:session', async (req, res) => {
+  try {
+    const result = await getContacts(req.params.session);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/messages/:session/:jid', async (req, res) => {
+  try {
+    const { session, jid } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+    const result = await getChatMessages(session, jid, limit);
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

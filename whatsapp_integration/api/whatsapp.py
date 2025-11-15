@@ -1,6 +1,6 @@
 import frappe
 from frappe.utils import now
-from whatsapp_integration.api.utils import mark_device_active, resolve_device_name
+from whatsapp_integration.api.utils import mark_device_active, resolve_device_name, find_party_by_number
 from whatsapp_integration.api.whatsapp_official import send_official
 from whatsapp_integration.api.whatsapp_unofficial import send_unofficial
 
@@ -10,6 +10,9 @@ def send_whatsapp_message(number, message, session=None):
     settings = frappe.get_doc("WhatsApp Settings")
     device_name = resolve_device_name(session)
     
+    # Auto-detect party type and name based on phone number
+    party_type, party_name = find_party_by_number(number)
+    
     # Log the message attempt
     log_doc = frappe.get_doc({
         "doctype": "WhatsApp Message Log",
@@ -17,7 +20,9 @@ def send_whatsapp_message(number, message, session=None):
         "message": message,
         "direction": "Out",
         "status": "Sending",
-        "device": device_name
+        "device": device_name,
+        "party_type": party_type,
+        "party_name": party_name
     })
     log_doc.insert(ignore_permissions=True)
     

@@ -16,16 +16,18 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 		constructor(page) {
 			this.page = page;
 			this.currentNumber = null;
+			this.currentJid = null;
 			this.beforeCursor = null;
 			this.searchDebounce = null;
 			this.isLoadingHistory = false;
+			this.whatsappChats = [];
+			this.whatsappContacts = [];
 
 			this.make_layout();
 			this.inject_styles();
 			this.bind_events();
 			this.listen_realtime();
 			this.refresh_devices();
-			this.load_recent_numbers();
 		}
 
 		make_layout() {
@@ -39,13 +41,17 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 								<option value="">${__("Auto (connected device)")}</option>
 							</select>
 						</div>
+						<div class="wa-load-actions">
+							<button class="btn btn-sm btn-primary wa-load-chats">${__("Load Chats")}</button>
+							<button class="btn btn-sm btn-secondary wa-load-contacts">${__("Load Contacts")}</button>
+						</div>
 						<div class="wa-chat-search">
 							<input type="text" class="form-control wa-search-input" placeholder="${__(
-								"Search number"
+								"Search number or name"
 							)}">
 						</div>
 						<div class="wa-chat-list empty-state">
-							${__("No conversations yet.")}
+							${__("Click 'Load Chats' or 'Load Contacts' to load from WhatsApp.")}
 						</div>
 					</div>
 					<div class="wa-chat-main">
@@ -112,6 +118,10 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 				.wa-load-older { align-self:center; margin:0.4rem 0; }
 				.wa-message-box { resize:vertical; min-height:90px; }
 				.wa-input-actions { text-align:right; margin-top:.5rem; }
+				.wa-load-actions { display:flex; gap:.5rem; margin-bottom:1rem; }
+				.wa-load-actions button { flex:1; }
+				.wa-chat-thread img { width:40px; height:40px; border-radius:50%; margin-right:.5rem; float:left; }
+				.wa-chat-thread .wa-thread-info { overflow:hidden; }
 			`;
 			document.head.appendChild(style);
 		}
@@ -119,12 +129,23 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 		bind_events() {
 			this.page.body.find(".wa-load-thread").on("click", () => this.load_thread(true));
 			this.$loadMoreBtn.on("click", () => this.load_thread(false));
+			
+			this.page.body.find(".wa-load-chats").on("click", () => this.load_whatsapp_chats());
+			this.page.body.find(".wa-load-contacts").on("click", () => this.load_whatsapp_contacts());
 
 			this.page.body.on("click", ".wa-chat-thread", (e) => {
+				const jid = e.currentTarget.dataset.jid || e.currentTarget.dataset.number;
 				const number = e.currentTarget.dataset.number;
-				if (!number) return;
-				this.$numberInput.val(number);
+				if (!jid && !number) return;
+				if (jid) {
+					this.currentJid = jid;
+				}
+				this.$numberInput.val(number || jid);
 				this.load_thread(true);
+			});
+
+			this.$sessionSelect.on("change", () => {
+				this.load_whatsapp_chats();
 			});
 
 			this.$messageBox.on("keydown", (e) => {
@@ -139,7 +160,7 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 			this.page.body.find(".wa-search-input").on("keyup", (e) => {
 				clearTimeout(this.searchDebounce);
 				this.searchDebounce = setTimeout(() => {
-					this.load_recent_numbers(e.currentTarget.value);
+					this.filter_chats(e.currentTarget.value);
 				}, 300);
 			});
 		}
@@ -147,7 +168,7 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 		listen_realtime() {
 			frappe.realtime.on("whatsapp_incoming_message", (payload) => {
 				if (!payload || !payload.number) return;
-				if (payload.number === this.currentNumber) {
+				if (payload.number === this.currentNumber || payload.session === this.$sessionSelect.val()) {
 					this.append_message({
 						message: payload.message,
 						direction: "In",
@@ -157,15 +178,21 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 						sent_time: payload.timestamp,
 					});
 				}
-				this.load_recent_numbers();
+				// Refresh chats if loaded
+				if (this.whatsappChats.length) {
+					this.load_whatsapp_chats();
+				}
 			});
 
 			frappe.realtime.on("whatsapp_chat_update", (payload) => {
 				if (!payload || !payload.number) return;
-				if (payload.number === this.currentNumber) {
+				if (payload.number === this.currentNumber || payload.session === this.$sessionSelect.val()) {
 					this.append_message(payload, payload.direction !== "In");
 				}
-				this.load_recent_numbers();
+				// Refresh chats if loaded
+				if (this.whatsappChats.length) {
+					this.load_whatsapp_chats();
+				}
 			});
 		}
 
@@ -222,10 +249,173 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 			});
 		}
 
+		load_whatsapp_chats() {
+			const session = this.$sessionSelect.val() || null;
+			frappe.call({
+				method: "whatsapp_integration.api.chat.load_whatsapp_chats",
+				args: { session },
+				freeze: true,
+				freeze_message: __("Loading chats from WhatsApp..."),
+				callback: (r) => {
+					if (r.message && r.message.success && r.message.chats) {
+						this.whatsappChats = r.message.chats;
+						this.render_chats_list();
+					} else {
+						frappe.msgprint(__("Failed to load chats from WhatsApp."));
+					}
+				},
+				error: () => {
+					frappe.msgprint(__("Error loading chats. Check Node service and device status."));
+				},
+			});
+		}
+
+		load_whatsapp_contacts() {
+			const session = this.$sessionSelect.val() || null;
+			frappe.call({
+				method: "whatsapp_integration.api.chat.load_whatsapp_contacts",
+				args: { session },
+				freeze: true,
+				freeze_message: __("Loading contacts from WhatsApp..."),
+				callback: (r) => {
+					if (r.message && r.message.success && r.message.contacts) {
+						this.whatsappContacts = r.message.contacts;
+						this.render_contacts_list();
+					} else {
+						frappe.msgprint(__("Failed to load contacts from WhatsApp."));
+					}
+				},
+				error: () => {
+					frappe.msgprint(__("Error loading contacts. Check Node service and device status."));
+				},
+			});
+		}
+
+		render_chats_list() {
+			if (!this.whatsappChats.length) {
+				this.$chatList
+					.addClass("empty-state")
+					.html(`<div class="text-muted small">${__("No chats found.")}</div>`);
+				return;
+			}
+			this.$chatList.removeClass("empty-state").empty();
+			this.whatsappChats.forEach((chat) => {
+				const name = frappe.utils.escape_html(chat.name || chat.number || "");
+				const number = frappe.utils.escape_html(chat.number || "");
+				const jid = chat.id || chat.number;
+				const isGroup = chat.isGroup || false;
+				const profilePic = chat.profilePicture || "";
+				
+				const thread = $(`
+					<div class="wa-chat-thread" data-jid="${jid}" data-number="${number}">
+						${profilePic ? `<img src="${profilePic}" alt="${name}" onerror="this.style.display='none'">` : ""}
+						<div class="wa-thread-info">
+							<strong>${name}</strong>
+							<small>${number} ${isGroup ? __("(Group)") : ""}</small>
+						</div>
+					</div>
+				`);
+				if (jid === this.currentJid || number === this.currentNumber) {
+					thread.addClass("active");
+				}
+				this.$chatList.append(thread);
+			});
+		}
+
+		render_contacts_list() {
+			if (!this.whatsappContacts.length) {
+				this.$chatList
+					.addClass("empty-state")
+					.html(`<div class="text-muted small">${__("No contacts found.")}</div>`);
+				return;
+			}
+			this.$chatList.removeClass("empty-state").empty();
+			this.whatsappContacts.forEach((contact) => {
+				const name = frappe.utils.escape_html(contact.name || contact.number || "");
+				const number = frappe.utils.escape_html(contact.number || "");
+				const jid = contact.id || contact.number;
+				const profilePic = contact.profilePicture || "";
+				
+				const thread = $(`
+					<div class="wa-chat-thread" data-jid="${jid}" data-number="${number}">
+						${profilePic ? `<img src="${profilePic}" alt="${name}" onerror="this.style.display='none'">` : ""}
+						<div class="wa-thread-info">
+							<strong>${name}</strong>
+							<small>${number}</small>
+						</div>
+					</div>
+				`);
+				if (jid === this.currentJid || number === this.currentNumber) {
+					thread.addClass("active");
+				}
+				this.$chatList.append(thread);
+			});
+		}
+
+		filter_chats(search) {
+			if (!search) {
+				if (this.whatsappChats.length) {
+					this.render_chats_list();
+				} else if (this.whatsappContacts.length) {
+					this.render_contacts_list();
+				} else {
+					this.load_recent_numbers();
+				}
+				return;
+			}
+			
+			const searchLower = search.toLowerCase();
+			const filtered = [];
+			
+			if (this.whatsappChats.length) {
+				filtered.push(...this.whatsappChats.filter(
+					(chat) => 
+						(chat.name && chat.name.toLowerCase().includes(searchLower)) ||
+						(chat.number && chat.number.includes(search))
+				));
+			} else if (this.whatsappContacts.length) {
+				filtered.push(...this.whatsappContacts.filter(
+					(contact) => 
+						(contact.name && contact.name.toLowerCase().includes(searchLower)) ||
+						(contact.number && contact.number.includes(search))
+				));
+			}
+			
+			if (filtered.length) {
+				this.$chatList.removeClass("empty-state").empty();
+				filtered.forEach((item) => {
+					const name = frappe.utils.escape_html(item.name || item.number || "");
+					const number = frappe.utils.escape_html(item.number || "");
+					const jid = item.id || item.number;
+					const isGroup = item.isGroup || false;
+					const profilePic = item.profilePicture || "";
+					
+					const thread = $(`
+						<div class="wa-chat-thread" data-jid="${jid}" data-number="${number}">
+							${profilePic ? `<img src="${profilePic}" alt="${name}" onerror="this.style.display='none'">` : ""}
+							<div class="wa-thread-info">
+								<strong>${name}</strong>
+								<small>${number} ${isGroup ? __("(Group)") : ""}</small>
+							</div>
+						</div>
+					`);
+					if (jid === this.currentJid || number === this.currentNumber) {
+						thread.addClass("active");
+					}
+					this.$chatList.append(thread);
+				});
+			} else {
+				this.$chatList
+					.addClass("empty-state")
+					.html(`<div class="text-muted small">${__("No matches found.")}</div>`);
+			}
+		}
+
 		load_thread(resetCursor) {
+			const jid = this.currentJid || (this.$numberInput.val() || "").trim();
 			const number = (this.$numberInput.val() || "").trim();
-			if (!number) {
-				frappe.msgprint(__("Enter a phone number first."));
+			if (!jid && !number) {
+				frappe.msgprint(__("Enter a phone number or select a chat first."));
 				return;
 			}
 			if (this.isLoadingHistory) return;
@@ -235,13 +425,51 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 				this.beforeCursor = null;
 				this.$history.empty();
 				this.currentNumber = number;
+				this.currentJid = jid;
 				this.$chatList.find(".wa-chat-thread").removeClass("active");
 				this.$chatList
 					.find(".wa-chat-thread")
-					.filter((_, el) => el.dataset.number === number)
+					.filter((_, el) => el.dataset.jid === jid || el.dataset.number === number)
 					.addClass("active");
 			}
 
+			// Try loading from WhatsApp first if we have JID
+			if (jid && jid.includes("@")) {
+				const session = this.$sessionSelect.val() || null;
+				frappe.call({
+					method: "whatsapp_integration.api.chat.load_whatsapp_messages",
+					args: { session, jid, limit: PAGE_SIZE },
+					callback: (r) => {
+						if (r.message && r.message.success && r.message.messages) {
+							const messages = r.message.messages.map((msg) => ({
+								number: msg.from,
+								message: msg.message,
+								direction: msg.fromMe ? "Out" : "In",
+								status: msg.status || (msg.fromMe ? "Sent" : "Received"),
+								sent_time: msg.timestamp,
+								device: null,
+							}));
+							this.render_messages(messages, resetCursor);
+							this.$loadMoreBtn.prop("disabled", messages.length < PAGE_SIZE);
+						} else {
+							// Fallback to database
+							this.load_thread_from_db(number, resetCursor);
+						}
+						this.$headerSession.text(
+							this.$sessionSelect.find("option:selected").text() || __("Auto")
+						);
+					},
+					always: () => {
+						this.isLoadingHistory = false;
+					},
+				});
+			} else {
+				// Load from database
+				this.load_thread_from_db(number, resetCursor);
+			}
+		}
+
+		load_thread_from_db(number, resetCursor) {
 			const args = { number, limit: PAGE_SIZE };
 			if (!resetCursor && this.beforeCursor) {
 				args.before = this.beforeCursor;
