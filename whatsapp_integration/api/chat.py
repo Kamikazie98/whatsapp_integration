@@ -335,14 +335,9 @@ def get_websocket_url():
     
     base = _get_node_base_url()
     parsed = urlparse(base)
-    scheme = parsed.scheme or "http"
-    netloc = parsed.netloc or parsed.path
-    if not netloc:
-        frappe.throw(_("Invalid Node service URL"))
-    ws_scheme = "wss" if scheme == "https" else "ws"
-    base_path = "192.168.85.167:8001"
-    suffix = f"{base_path}/ws/chat" 
-    return {"url": f"{ws_scheme}://{netloc}{suffix}"}
+    ws_scheme = "wss" if (parsed.scheme or "http") == "https" else "ws"
+    hostname = "192.168.85.167:8001"
+    return {"url": f"{ws_scheme}://{hostname}/ws/chat"}
 
 
 @frappe.whitelist()
