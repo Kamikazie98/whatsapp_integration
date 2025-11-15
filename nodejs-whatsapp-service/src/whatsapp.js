@@ -5,6 +5,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeInMemoryStore,
 } = require("baileys");
 import QRCode from "qrcode";
 import axios from "axios";
@@ -22,7 +23,90 @@ if (!fs.existsSync(sessionRoot)) {
   fs.mkdirSync(sessionRoot, { recursive: true });
 }
 
+const storeRoot = path.join(sessionRoot, "store");
+if (!fs.existsSync(storeRoot)) {
+  fs.mkdirSync(storeRoot, { recursive: true });
+}
+
 const defaultQueryTimeoutMs = Number(process.env.BAILEYS_QUERY_TIMEOUT_MS || 90000);
+const STORE_PERSIST_INTERVAL_MS = Number(process.env.WA_STORE_PERSIST_INTERVAL_MS || 10000);
+
+const sessionStores = new Map();
+
+function ensureSessionStoreEntry(sid) {
+  if (sessionStores.has(sid)) {
+    return sessionStores.get(sid);
+  }
+  const storeLogger = pino({ level: "silent" }).child({ module: "wa-store", sid });
+  const store = makeInMemoryStore({ logger: storeLogger });
+  const storeFile = path.join(storeRoot, `${sid}.json`);
+  if (fs.existsSync(storeFile)) {
+    try {
+      store.readFromFile(storeFile);
+    } catch (err) {
+      console.warn(`Failed loading chat store for ${sid}:`, err.message);
+    }
+  }
+  const entry = {
+    store,
+    storeFile,
+    persistInterval: null,
+    persist() {
+      try {
+        fs.mkdirSync(path.dirname(storeFile), { recursive: true });
+        store.writeToFile(storeFile);
+      } catch (err) {
+        console.warn(`Failed persisting chat store for ${sid}:`, err.message);
+      }
+    },
+  };
+  sessionStores.set(sid, entry);
+  return entry;
+}
+
+function bindStoreToSocket(sid, sock) {
+  const entry = ensureSessionStoreEntry(sid);
+  entry.store.bind(sock.ev);
+  if (!entry.persistInterval) {
+    entry.persistInterval = setInterval(entry.persist, STORE_PERSIST_INTERVAL_MS);
+  }
+  return entry.store;
+}
+
+function teardownSessionStore(sid, { removeEntry = true } = {}) {
+  const entry = sessionStores.get(sid);
+  if (!entry) return;
+  if (entry.persistInterval) {
+    clearInterval(entry.persistInterval);
+    entry.persistInterval = null;
+  }
+  entry.persist();
+  if (removeEntry) {
+    sessionStores.delete(sid);
+  }
+}
+
+function purgeSessionStoreFile(sid) {
+  const storeFile = path.join(storeRoot, `${sid}.json`);
+  if (fs.existsSync(storeFile)) {
+    try {
+      fs.rmSync(storeFile, { force: true });
+    } catch (err) {
+      console.warn(`Failed deleting chat store for ${sid}:`, err.message);
+    }
+  }
+}
+
+async function loadMessagesFromStore(sid, jid, limit) {
+  try {
+    const entry = ensureSessionStoreEntry(sid);
+    const stored = await entry.store.loadMessages(jid, limit);
+    return Array.isArray(stored) ? stored : [];
+  } catch (err) {
+    console.warn(`Failed loading stored messages for ${sid}/${jid}:`, err.message);
+    return [];
+  }
+}
 
 function normalizeSessionId(id) {
   return String(id || "default").replace(/[^0-9A-Za-z_\-]/g, "");
@@ -109,6 +193,10 @@ function safeTimestamp(msg) {
     return new Date(Number(ms)).toISOString();
   }
   return new Date().toISOString();
+}
+
+function numericTimestamp(msg) {
+  return new Date(safeTimestamp(msg)).getTime();
 }
 
 function extractNumber(raw) {
@@ -200,10 +288,11 @@ export async function startSession(sessionId) {
       printQRInTerminal: false,
       browser: ["Chrome", "Linux", "120.0.0"],
       markOnlineOnConnect: false,
-      syncFullHistory: false,
+      syncFullHistory: true,
       defaultQueryTimeoutMs,
       logger: pino({ level: "info" }),
     });
+    bindStoreToSocket(sid, sock);
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -247,6 +336,7 @@ export async function startSession(sessionId) {
         // Always drop the in-memory session handle so restart can proceed
         delete sessions[sid];
         messageHistory.delete(sid);
+        teardownSessionStore(sid);
         if (!removed) {
           setTimeout(() => startSession(sid), 1500);
         } else {
@@ -394,6 +484,8 @@ export function resetSession(sessionId) {
     delete qrCodes[sid];
     readySessions.delete(sid);
     messageHistory.delete(sid);
+    teardownSessionStore(sid);
+    purgeSessionStoreFile(sid);
     return { success: true };
   } catch (e) {
     return { success: false, error: String(e) };
@@ -505,12 +597,28 @@ export async function getChatMessages(sessionId, jid, limit = 50) {
     const history = sessionStore?.get(normalizedJid) || [];
     const cappedLimit = Math.max(1, Math.min(Number(limit) || 50, MAX_HISTORY_PER_CHAT));
     const recent = history.slice(-cappedLimit);
-    const formatted = recent.map((msg) => formatHistoryMessage(msg, normalizedJid));
+    let formatted = recent.map((msg) => formatHistoryMessage(msg, normalizedJid));
+    if (!formatted.length) {
+      const storedMessages = await loadMessagesFromStore(sid, normalizedJid, cappedLimit);
+      if (storedMessages.length) {
+        storedMessages.sort((a, b) => numericTimestamp(a) - numericTimestamp(b));
+        formatted = storedMessages.map((msg) => formatHistoryMessage(msg, normalizedJid));
+        const historyMap = getSessionHistory(sid);
+        historyMap.set(
+          normalizedJid,
+          trimHistory(storedMessages.slice(-MAX_HISTORY_PER_CHAT))
+        );
+      }
+    } else {
+      formatted.sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+    }
     if (!formatted.length) {
       return {
-        success: false,
+        success: true,
         messages: [],
-        note: "No in-memory chat history. Falling back to ERPNext logs.",
+        note: "No WhatsApp chat history available yet for this conversation.",
       };
     }
     return { success: true, messages: formatted };
