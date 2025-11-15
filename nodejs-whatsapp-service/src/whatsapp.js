@@ -5,7 +5,6 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeInMemoryStore,
 } = require("baileys");
 import QRCode from "qrcode";
 import axios from "axios";
@@ -23,90 +22,13 @@ if (!fs.existsSync(sessionRoot)) {
   fs.mkdirSync(sessionRoot, { recursive: true });
 }
 
-const storeRoot = path.join(sessionRoot, "store");
-if (!fs.existsSync(storeRoot)) {
-  fs.mkdirSync(storeRoot, { recursive: true });
-}
-
 const defaultQueryTimeoutMs = Number(process.env.BAILEYS_QUERY_TIMEOUT_MS || 90000);
-const STORE_PERSIST_INTERVAL_MS = Number(process.env.WA_STORE_PERSIST_INTERVAL_MS || 10000);
-
-const sessionStores = new Map();
-
-function ensureSessionStoreEntry(sid) {
-  if (sessionStores.has(sid)) {
-    return sessionStores.get(sid);
-  }
-  const storeLogger = pino({ level: "silent" }).child({ module: "wa-store", sid });
-  const store = makeInMemoryStore({ logger: storeLogger });
-  const storeFile = path.join(storeRoot, `${sid}.json`);
-  if (fs.existsSync(storeFile)) {
-    try {
-      store.readFromFile(storeFile);
-    } catch (err) {
-      console.warn(`Failed loading chat store for ${sid}:`, err.message);
-    }
-  }
-  const entry = {
-    store,
-    storeFile,
-    persistInterval: null,
-    persist() {
-      try {
-        fs.mkdirSync(path.dirname(storeFile), { recursive: true });
-        store.writeToFile(storeFile);
-      } catch (err) {
-        console.warn(`Failed persisting chat store for ${sid}:`, err.message);
-      }
-    },
-  };
-  sessionStores.set(sid, entry);
-  return entry;
+const HISTORY_PERSIST_INTERVAL_MS = Number(process.env.WA_HISTORY_PERSIST_INTERVAL_MS || 10000);
+const historyRoot = path.join(sessionRoot, "history");
+if (!fs.existsSync(historyRoot)) {
+  fs.mkdirSync(historyRoot, { recursive: true });
 }
-
-function bindStoreToSocket(sid, sock) {
-  const entry = ensureSessionStoreEntry(sid);
-  entry.store.bind(sock.ev);
-  if (!entry.persistInterval) {
-    entry.persistInterval = setInterval(entry.persist, STORE_PERSIST_INTERVAL_MS);
-  }
-  return entry.store;
-}
-
-function teardownSessionStore(sid, { removeEntry = true } = {}) {
-  const entry = sessionStores.get(sid);
-  if (!entry) return;
-  if (entry.persistInterval) {
-    clearInterval(entry.persistInterval);
-    entry.persistInterval = null;
-  }
-  entry.persist();
-  if (removeEntry) {
-    sessionStores.delete(sid);
-  }
-}
-
-function purgeSessionStoreFile(sid) {
-  const storeFile = path.join(storeRoot, `${sid}.json`);
-  if (fs.existsSync(storeFile)) {
-    try {
-      fs.rmSync(storeFile, { force: true });
-    } catch (err) {
-      console.warn(`Failed deleting chat store for ${sid}:`, err.message);
-    }
-  }
-}
-
-async function loadMessagesFromStore(sid, jid, limit) {
-  try {
-    const entry = ensureSessionStoreEntry(sid);
-    const stored = await entry.store.loadMessages(jid, limit);
-    return Array.isArray(stored) ? stored : [];
-  } catch (err) {
-    console.warn(`Failed loading stored messages for ${sid}/${jid}:`, err.message);
-    return [];
-  }
-}
+const historyPersistTimers = new Map();
 
 function normalizeSessionId(id) {
   return String(id || "default").replace(/[^0-9A-Za-z_\-]/g, "");
@@ -153,6 +75,76 @@ function trimHistory(list) {
   return list;
 }
 
+function historyFilePath(sid) {
+  return path.join(historyRoot, `${sid}.json`);
+}
+
+function persistSessionHistory(sid) {
+  const store = messageHistory.get(sid);
+  if (!store) return;
+  const plain = {};
+  for (const [jid, entries] of store.entries()) {
+    if (entries?.length) {
+      plain[jid] = entries;
+    }
+  }
+  try {
+    fs.mkdirSync(historyRoot, { recursive: true });
+    fs.writeFileSync(historyFilePath(sid), JSON.stringify(plain));
+  } catch (err) {
+    console.warn(`Failed writing chat history for ${sid}:`, err.message);
+  }
+}
+
+function cancelHistoryPersist(sid) {
+  const timer = historyPersistTimers.get(sid);
+  if (timer) {
+    clearTimeout(timer);
+    historyPersistTimers.delete(sid);
+  }
+}
+
+function scheduleHistoryPersist(sid) {
+  if (historyPersistTimers.has(sid)) return;
+  const timer = setTimeout(() => {
+    historyPersistTimers.delete(sid);
+    persistSessionHistory(sid);
+  }, HISTORY_PERSIST_INTERVAL_MS);
+  historyPersistTimers.set(sid, timer);
+}
+
+function loadSessionHistoryFromDisk(sid) {
+  const file = historyFilePath(sid);
+  if (!fs.existsSync(file)) {
+    getSessionHistory(sid);
+    return;
+  }
+  try {
+    const content = JSON.parse(fs.readFileSync(file, "utf8"));
+    const store = getSessionHistory(sid);
+    store.clear();
+    Object.entries(content || {}).forEach(([jid, entries]) => {
+      if (Array.isArray(entries) && entries.length) {
+        store.set(jid, trimHistory(entries));
+      }
+    });
+  } catch (err) {
+    console.warn(`Failed loading chat history for ${sid}:`, err.message);
+    getSessionHistory(sid);
+  }
+}
+
+function purgeSessionHistoryFile(sid) {
+  const file = historyFilePath(sid);
+  try {
+    if (fs.existsSync(file)) {
+      fs.rmSync(file, { force: true });
+    }
+  } catch (err) {
+    console.warn(`Failed deleting chat history for ${sid}:`, err.message);
+  }
+}
+
 function extractMessageText(msg) {
   const body = msg?.message || {};
   return (
@@ -168,13 +160,16 @@ function extractMessageText(msg) {
 }
 
 function rememberMessage(sid, msg) {
-  if (!msg?.message) return;
+  if (!msg?.message) return null;
   const canonical = canonicalChatJid(msg.key?.remoteJid, msg.key?.senderPn);
-  if (!canonical) return;
+  if (!canonical) return null;
+  const formatted = formatHistoryMessage(msg, canonical);
   const historyMap = getSessionHistory(sid);
   const history = historyMap.get(canonical) || [];
-  history.push(msg);
+  history.push(formatted);
   historyMap.set(canonical, trimHistory(history));
+  scheduleHistoryPersist(sid);
+  return { canonical, formatted };
 }
 
 function safeTimestamp(msg) {
@@ -193,10 +188,6 @@ function safeTimestamp(msg) {
     return new Date(Number(ms)).toISOString();
   }
   return new Date().toISOString();
-}
-
-function numericTimestamp(msg) {
-  return new Date(safeTimestamp(msg)).getTime();
 }
 
 function extractNumber(raw) {
@@ -281,6 +272,7 @@ export async function startSession(sessionId) {
     const authPath = path.join(sessionRoot, sid);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const { version } = await fetchLatestBaileysVersion();
+    loadSessionHistoryFromDisk(sid);
 
     const sock = makeWASocket({
       version,
@@ -335,8 +327,8 @@ export async function startSession(sessionId) {
         }
         // Always drop the in-memory session handle so restart can proceed
         delete sessions[sid];
-        messageHistory.delete(sid);
-        teardownSessionStore(sid);
+        persistSessionHistory(sid);
+        cancelHistoryPersist(sid);
         if (!removed) {
           setTimeout(() => startSession(sid), 1500);
         } else {
@@ -357,11 +349,9 @@ export async function startSession(sessionId) {
     sock.ev.on("messages.upsert", async (m) => {
       const incoming = m.messages || [];
       for (const msg of incoming) {
-        rememberMessage(sid, msg);
-        const canonical = canonicalChatJid(msg.key?.remoteJid, msg.key?.senderPn);
-        if (canonical) {
-          const formatted = formatHistoryMessage(msg, canonical);
-          emitRealtimeUpdate(sid, canonical, formatted);
+        const remembered = rememberMessage(sid, msg);
+        if (remembered) {
+          emitRealtimeUpdate(sid, remembered.canonical, remembered.formatted);
         }
         if (!msg.key?.fromMe && msg.message) {
           try {
@@ -393,7 +383,6 @@ export async function startSession(sessionId) {
       }
     });
 
-    messageHistory.set(sid, new Map());
     sessions[sid] = sock;
     console.log(`Session ${sid} started successfully`);
     return "Session started";
@@ -483,9 +472,10 @@ export function resetSession(sessionId) {
     delete sessions[sid];
     delete qrCodes[sid];
     readySessions.delete(sid);
+    persistSessionHistory(sid);
+    cancelHistoryPersist(sid);
     messageHistory.delete(sid);
-    teardownSessionStore(sid);
-    purgeSessionStoreFile(sid);
+    purgeSessionHistoryFile(sid);
     return { success: true };
   } catch (e) {
     return { success: false, error: String(e) };
@@ -593,27 +583,14 @@ export async function getChatMessages(sessionId, jid, limit = 50) {
     if (!normalizedJid) {
       throw new Error("Chat ID (JID) is required.");
     }
-    const sessionStore = messageHistory.get(sid);
+    const sessionStore = messageHistory.get(sid) || getSessionHistory(sid);
     const history = sessionStore?.get(normalizedJid) || [];
     const cappedLimit = Math.max(1, Math.min(Number(limit) || 50, MAX_HISTORY_PER_CHAT));
     const recent = history.slice(-cappedLimit);
-    let formatted = recent.map((msg) => formatHistoryMessage(msg, normalizedJid));
-    if (!formatted.length) {
-      const storedMessages = await loadMessagesFromStore(sid, normalizedJid, cappedLimit);
-      if (storedMessages.length) {
-        storedMessages.sort((a, b) => numericTimestamp(a) - numericTimestamp(b));
-        formatted = storedMessages.map((msg) => formatHistoryMessage(msg, normalizedJid));
-        const historyMap = getSessionHistory(sid);
-        historyMap.set(
-          normalizedJid,
-          trimHistory(storedMessages.slice(-MAX_HISTORY_PER_CHAT))
-        );
-      }
-    } else {
-      formatted.sort(
-        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-      );
-    }
+    const formatted = recent.slice();
+    formatted.sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
     if (!formatted.length) {
       return {
         success: true,
