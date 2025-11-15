@@ -340,7 +340,7 @@ def get_websocket_url():
     if not netloc:
         frappe.throw(_("Invalid Node service URL"))
     ws_scheme = "wss" if scheme == "https" else "ws"
-    base_path = parsed.path.rstrip("/")
+    base_path = "192.168.85.167:8001"
     suffix = f"{base_path}/ws/chat" if base_path else "/ws/chat"
     return {"url": f"{ws_scheme}://{netloc}{suffix}"}
 
