@@ -284,7 +284,6 @@ export async function startSession(sessionId) {
       defaultQueryTimeoutMs,
       logger: pino({ level: "info" }),
     });
-    bindStoreToSocket(sid, sock);
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
