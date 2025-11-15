@@ -149,13 +149,13 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 			this.page.body.find(".wa-load-contacts").on("click", () => this.load_whatsapp_contacts());
 
 			this.page.body.on("click", ".wa-chat-thread", (e) => {
-				const jid = e.currentTarget.dataset.jid || e.currentTarget.dataset.number;
-				const number = e.currentTarget.dataset.number;
-				if (!jid && !number) return;
-				if (jid) {
-					this.currentJid = jid;
-				}
-				this.$numberInput.val(number || jid);
+				const rawJid = e.currentTarget.dataset.jid || "";
+				const rawNumber = e.currentTarget.dataset.number || "";
+				if (!rawJid && !rawNumber) return;
+				const normalizedJid = this.normalize_jid(rawJid || rawNumber);
+				const displayNumber = rawNumber || this.jid_to_number(normalizedJid) || rawJid;
+				this.currentJid = normalizedJid;
+				this.$numberInput.val(displayNumber);
 				this.load_thread(true);
 			});
 
@@ -178,6 +178,19 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 					this.filter_chats(e.currentTarget.value);
 				}, 300);
 			});
+		}
+
+		normalize_jid(value) {
+			const raw = (value || "").trim().toLowerCase();
+			if (!raw) return null;
+			if (raw.includes("@")) return raw;
+			const looksLikeGroup = /^\d{6,}-\d{3,}$/.test(raw);
+			return `${raw}${looksLikeGroup ? "@g.us" : "@s.whatsapp.net"}`;
+		}
+
+		jid_to_number(value) {
+			if (!value) return "";
+			return value.replace(/@.+$/, "");
 		}
 
 		listen_realtime() {
@@ -744,8 +757,33 @@ subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
 
 		load_thread(resetCursor) {
 			const inputValue = (this.$numberInput.val() || "").trim();
-			const jid = resetCursor ? inputValue : this.currentJid || inputValue;
-			const number = resetCursor ? inputValue : this.currentNumber || inputValue;
+			const inputLooksLikeJid = inputValue.includes("@");
+			const normalizedInputJid = this.normalize_jid(inputValue);
+			const numberFromInput = inputLooksLikeJid ? this.jid_to_number(inputValue) : inputValue;
+
+			let jid = this.currentJid;
+			if (resetCursor) {
+				if (inputValue) {
+					if (inputLooksLikeJid) {
+						jid = normalizedInputJid;
+					} else if (this.currentJid && this.jid_to_number(this.currentJid) === numberFromInput) {
+						jid = this.currentJid;
+					} else {
+						jid = normalizedInputJid;
+					}
+				}
+			} else if (!jid) {
+				jid = normalizedInputJid;
+			}
+
+			let number = resetCursor ? numberFromInput : this.currentNumber || numberFromInput;
+			if (resetCursor && !number && this.currentNumber) {
+				number = this.currentNumber;
+			}
+			if (!number && jid) {
+				number = this.jid_to_number(jid);
+			}
+
 			if (!jid && !number) {
 				frappe.msgprint(__("Enter a phone number or select a chat first."));
 				return;
@@ -761,6 +799,7 @@ subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
 				this.currentNumber = number;
 				this.currentJid = jid;
 				this.currentMessages = [];
+				this.$numberInput.val(this.currentNumber || this.jid_to_number(jid) || "");
 				this.$chatList.find(".wa-chat-thread").removeClass("active");
 				this.$chatList
 					.find(".wa-chat-thread")
@@ -798,7 +837,7 @@ subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
 							this.render_messages(messages, resetCursor);
 							this.$loadMoreBtn.prop("disabled", messages.length < PAGE_SIZE);
 						} else {
-							this.load_thread_from_db(number || this.currentNumber, resetCursor);
+							this.load_thread_from_db(number, resetCursor);
 						}
 					},
 					always: () => {
@@ -809,7 +848,7 @@ subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
 			}
 
 			// Load from database
-			this.load_thread_from_db(number || this.currentNumber, resetCursor);
+			this.load_thread_from_db(number, resetCursor);
 		}
 
 		load_thread_from_db(number, resetCursor) {
