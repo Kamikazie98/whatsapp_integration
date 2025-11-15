@@ -335,7 +335,17 @@ def get_websocket_url():
     
     base = _get_node_base_url()
     parsed = urlparse(base)
-    ws_scheme = "wss" if (parsed.scheme or "http") == "https" else "ws"
+    # Prefer secure websocket when either Node service uses HTTPS or the current site is served over HTTPS.
+    is_secure_request = False
+    request = getattr(frappe.local, "request", None)
+    if request:
+        is_secure_request = getattr(request, "scheme", "").lower() == "https"
+    if not is_secure_request:
+        try:
+            is_secure_request = frappe.utils.get_url().lower().startswith("https://")
+        except Exception:
+            is_secure_request = False
+    ws_scheme = "wss" if (parsed.scheme or "").lower() == "https" or is_secure_request else "ws"
     hostname = "erp.clickapps.ir"
     return {"url": f"{ws_scheme}://{hostname}/ws/chat"}
 
