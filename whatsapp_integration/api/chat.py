@@ -336,7 +336,7 @@ def get_websocket_url():
     base = _get_node_base_url()
     parsed = urlparse(base)
     ws_scheme = "wss" if (parsed.scheme or "http") == "https" else "ws"
-    hostname = "192.168.85.167:8001"
+    hostname = "erp.clickapps.ir"
     return {"url": f"{ws_scheme}://{hostname}/ws/chat"}
 
 
