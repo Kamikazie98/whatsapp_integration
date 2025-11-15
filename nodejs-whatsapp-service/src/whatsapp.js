@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import config from "./config.js";
 import pino from "pino";
+import { EventEmitter } from "events";
 
 // Normalize and stabilize session storage path
 const sessionRoot = path.isAbsolute(config.session_path)
@@ -34,6 +35,13 @@ const starting = new Set(); // prevent concurrent startSession per sid
 const backoffUntil = new Map(); // sid -> timestamp ms when next attempt is allowed
 const messageHistory = new Map(); // sid -> Map<jid, message[]>
 const MAX_HISTORY_PER_CHAT = Number(process.env.WA_CHAT_HISTORY_LIMIT || 200);
+const realtimeEmitter = new EventEmitter();
+
+export function onRealtimeMessage(handler) {
+  if (typeof handler === "function") {
+    realtimeEmitter.on("message", handler);
+  }
+}
 
 function normalizeChatJid(jid) {
   if (!jid) return null;
@@ -130,6 +138,17 @@ function formatHistoryMessage(msg, requestedJid) {
     timestamp: safeTimestamp(msg),
     status: msg?.status || (msg?.key?.fromMe ? "sent" : "received"),
   };
+}
+
+function emitRealtimeUpdate(sid, chatJid, formatted) {
+  if (!sid || !chatJid || !formatted) {
+    return;
+  }
+  realtimeEmitter.emit("message", {
+    session: sid,
+    jid: chatJid,
+    message: formatted,
+  });
 }
 
 export async function getQR(sessionId) {
@@ -249,6 +268,11 @@ export async function startSession(sessionId) {
       const incoming = m.messages || [];
       for (const msg of incoming) {
         rememberMessage(sid, msg);
+        const canonical = canonicalChatJid(msg.key?.remoteJid, msg.key?.senderPn);
+        if (canonical) {
+          const formatted = formatHistoryMessage(msg, canonical);
+          emitRealtimeUpdate(sid, canonical, formatted);
+        }
         if (!msg.key?.fromMe && msg.message) {
           try {
             const messageText = extractMessageText(msg);

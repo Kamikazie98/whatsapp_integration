@@ -22,11 +22,26 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 			this.isLoadingHistory = false;
 			this.whatsappChats = [];
 			this.whatsappContacts = [];
+			this.currentMessages = [];
+			this.sessionCache = {};
+			this.wsUrl = null;
+			this.ws = null;
+			this.wsQueue = [];
+			this.wsReconnectTimer = null;
+			this.wsReady = false;
+			this.pendingSubscription = null;
+			this.currentSubscriptionKey = null;
+			this.awaitingHistory = false;
+			this.historyFallbackTimer = null;
+			this.historyFallbackContext = null;
+			this.wsSessionId = null;
+			this.wsJid = null;
 
 			this.make_layout();
 			this.inject_styles();
 			this.bind_events();
 			this.listen_realtime();
+			this.setup_live_bridge();
 			this.refresh_devices();
 		}
 
@@ -169,14 +184,16 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 			frappe.realtime.on("whatsapp_incoming_message", (payload) => {
 				if (!payload || !payload.number) return;
 				if (payload.number === this.currentNumber || payload.session === this.$sessionSelect.val()) {
-					this.append_message({
-						message: payload.message,
-						direction: "In",
-						number: payload.number,
-						device: payload.device,
-						status: "Received",
-						sent_time: payload.timestamp,
-					});
+					if (!this.currentSubscriptionKey) {
+						this.append_message({
+							message: payload.message,
+							direction: "In",
+							number: payload.number,
+							device: payload.device,
+							status: "Received",
+							sent_time: payload.timestamp,
+						});
+					}
 				}
 				// Refresh chats if loaded
 				if (this.whatsappChats.length) {
@@ -187,13 +204,224 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 			frappe.realtime.on("whatsapp_chat_update", (payload) => {
 				if (!payload || !payload.number) return;
 				if (payload.number === this.currentNumber || payload.session === this.$sessionSelect.val()) {
-					this.append_message(payload, payload.direction !== "In");
+					if (!this.currentSubscriptionKey) {
+						this.append_message(payload, payload.direction !== "In");
+					}
 				}
 				// Refresh chats if loaded
 				if (this.whatsappChats.length) {
 					this.load_whatsapp_chats();
 				}
 			});
+		}
+
+		setup_live_bridge() {
+			frappe.call({
+				method: "whatsapp_integration.api.chat.get_websocket_url",
+				callback: (r) => {
+					const url = r.message && r.message.url;
+					if (url) {
+						this.wsUrl = url;
+						this.connect_websocket();
+					}
+				},
+			});
+		}
+
+		connect_websocket() {
+			if (!this.wsUrl) return;
+			try {
+				if (this.ws) {
+					this.ws.close();
+				}
+				this.ws = new WebSocket(this.wsUrl);
+			} catch (err) {
+				console.warn("WhatsApp chat WebSocket failed:", err);
+				this.schedule_ws_reconnect();
+				return;
+			}
+			this.ws.onopen = () => {
+				this.wsReady = true;
+				const queued = this.wsQueue.splice(0);
+				queued.forEach((payload) => {
+					try {
+						this.ws.send(payload);
+					} catch (e) {
+						console.warn("Failed sending queued WS payload", e);
+					}
+				});
+				if (this.pendingSubscription) {
+					this.send_ws_command({ type: "subscribe", ...this.pendingSubscription });
+					this.pendingSubscription = null;
+				}
+			};
+			this.ws.onclose = () => {
+				this.wsReady = false;
+				this.schedule_ws_reconnect();
+			};
+			this.ws.onerror = () => {};
+			this.ws.onmessage = (event) => this.handle_ws_message(event);
+		}
+
+		schedule_ws_reconnect() {
+			if (this.wsReconnectTimer || !this.wsUrl) return;
+			this.wsReconnectTimer = setTimeout(() => {
+				this.wsReconnectTimer = null;
+				this.connect_websocket();
+			}, 3000);
+		}
+
+		send_ws_command(payload) {
+			if (!this.ws) return;
+			const serialized = JSON.stringify(payload);
+			if (this.ws.readyState === WebSocket.OPEN) {
+				this.ws.send(serialized);
+			} else {
+				this.wsQueue.push(serialized);
+			}
+		}
+
+		subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
+			if (!this.wsUrl) return;
+			const normalizedSession = session || "default";
+			const baseJid = (jid || "").toLowerCase();
+			const normalizedJid = baseJid.includes("@") ? baseJid : `${baseJid}@s.whatsapp.net`;
+			const key = `${normalizedSession}::${normalizedJid}`;
+			if (this.currentSubscriptionKey === key && !this.awaitingHistory) {
+				return;
+			}
+			if (this.currentSubscriptionKey && this.currentSubscriptionKey !== key && this.wsSessionId && this.wsJid) {
+				this.send_ws_command({
+					type: "unsubscribe",
+					session: this.wsSessionId,
+					jid: this.wsJid,
+				});
+			}
+			this.currentSubscriptionKey = key;
+			this.wsSessionId = normalizedSession;
+			this.wsJid = normalizedJid;
+			this.pendingSubscription = { session: normalizedSession, jid: normalizedJid, limit };
+			this.send_ws_command({ type: "subscribe", ...this.pendingSubscription });
+			this.pendingSubscription = null;
+		}
+
+		unsubscribe_realtime_chat() {
+			if (!this.currentSubscriptionKey || !this.wsSessionId || !this.wsJid) {
+				this.currentSubscriptionKey = null;
+				return;
+			}
+			this.send_ws_command({
+				type: "unsubscribe",
+				session: this.wsSessionId,
+				jid: this.wsJid,
+			});
+			this.currentSubscriptionKey = null;
+		}
+
+		handle_ws_message(event) {
+			let payload = null;
+			try {
+				payload = JSON.parse(event.data);
+			} catch (err) {
+				console.warn("Invalid WebSocket payload", err);
+				return;
+			}
+			if (!payload || !payload.type) return;
+			if (payload.type === "history") {
+				this.handle_ws_history(payload);
+			} else if (payload.type === "message") {
+				this.handle_ws_live_message(payload);
+			}
+		}
+
+		handle_ws_history(payload) {
+			const key = `${(payload.session || "default")}::${(payload.jid || "").toLowerCase()}`;
+			if (key !== this.currentSubscriptionKey) return;
+			this.awaitingHistory = false;
+			clearTimeout(this.historyFallbackTimer);
+			this.historyFallbackContext = null;
+			this.isLoadingHistory = false;
+			if (!payload.success) {
+				this.load_thread_from_db(this.currentNumber, true);
+				return;
+			}
+			const messages = this.map_ws_messages(payload.messages || []);
+			if (messages.length) {
+				this.beforeCursor = messages[0].sent_time;
+			}
+			this.render_messages(messages, true);
+			this.$loadMoreBtn.prop("disabled", messages.length < PAGE_SIZE);
+		}
+
+		handle_ws_live_message(payload) {
+			const key = `${(payload.session || "default")}::${(payload.jid || "").toLowerCase()}`;
+			if (key !== this.currentSubscriptionKey) return;
+			const entries = this.map_ws_messages([payload.message]);
+			if (entries.length) {
+				this.append_message(entries[0]);
+			}
+		}
+
+		map_ws_messages(messages) {
+			return (messages || [])
+				.map((msg) => {
+					if (!msg) return null;
+					return {
+						number: msg.from,
+						message: msg.message,
+						direction: msg.fromMe ? "Out" : "In",
+						status: msg.status || (msg.fromMe ? "Sent" : "Received"),
+						sent_time: msg.timestamp,
+						device: null,
+					};
+				})
+				.filter(Boolean);
+		}
+
+		resolve_node_session(session) {
+			const key = session || "__auto__";
+			if (this.sessionCache[key]) {
+				return Promise.resolve(this.sessionCache[key]);
+			}
+			return new Promise((resolve, reject) => {
+				frappe.call({
+					method: "whatsapp_integration.api.chat.resolve_node_session",
+					args: { session },
+					callback: (r) => {
+						const resolved = (r.message && r.message.session) || "default";
+						this.sessionCache[key] = resolved;
+						resolve(resolved);
+					},
+					error: (err) => reject(err),
+				});
+			});
+		}
+
+		load_thread_via_ws(number, jid, session, resetCursor) {
+			const targetNumber = number || this.currentNumber;
+			this.start_history_fallback(targetNumber, resetCursor);
+			this.resolve_node_session(session)
+				.then((resolvedSession) => {
+					this.subscribe_realtime_chat(resolvedSession, jid, PAGE_SIZE);
+				})
+				.catch(() => {
+					this.awaitingHistory = false;
+					clearTimeout(this.historyFallbackTimer);
+					this.load_thread_from_db(targetNumber, resetCursor);
+				});
+		}
+
+		start_history_fallback(number, resetCursor) {
+			clearTimeout(this.historyFallbackTimer);
+			this.historyFallbackContext = { number, resetCursor };
+			this.awaitingHistory = true;
+			this.historyFallbackTimer = setTimeout(() => {
+				this.awaitingHistory = false;
+				const ctx = this.historyFallbackContext;
+				if (ctx) {
+					this.load_thread_from_db(ctx.number, ctx.resetCursor);
+				}
+			}, 4000);
 		}
 
 		refresh_devices() {
@@ -412,30 +640,45 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 		}
 
 		load_thread(resetCursor) {
-			const jid = this.currentJid || (this.$numberInput.val() || "").trim();
-			const number = (this.$numberInput.val() || "").trim();
+			const inputValue = (this.$numberInput.val() || "").trim();
+			const jid = resetCursor ? inputValue : this.currentJid || inputValue;
+			const number = resetCursor ? inputValue : this.currentNumber || inputValue;
 			if (!jid && !number) {
 				frappe.msgprint(__("Enter a phone number or select a chat first."));
 				return;
 			}
 			if (this.isLoadingHistory) return;
+			clearTimeout(this.historyFallbackTimer);
+			this.historyFallbackContext = null;
+			this.awaitingHistory = false;
 
-			this.isLoadingHistory = true;
 			if (resetCursor) {
 				this.beforeCursor = null;
 				this.$history.empty();
 				this.currentNumber = number;
 				this.currentJid = jid;
+				this.currentMessages = [];
 				this.$chatList.find(".wa-chat-thread").removeClass("active");
 				this.$chatList
 					.find(".wa-chat-thread")
 					.filter((_, el) => el.dataset.jid === jid || el.dataset.number === number)
 					.addClass("active");
+				this.unsubscribe_realtime_chat();
 			}
 
-			// Try loading from WhatsApp first if we have JID
+			this.isLoadingHistory = true;
+
+			const session = this.$sessionSelect.val() || null;
+			this.$headerSession.text(this.$sessionSelect.find("option:selected").text() || __("Auto"));
+
+			const canUseRealtime = resetCursor && this.wsUrl && jid && jid.includes("@");
+			if (canUseRealtime) {
+				this.load_thread_via_ws(number, jid, session, resetCursor);
+				return;
+			}
+
+			// Try loading from Node service via server if we have JID
 			if (jid && jid.includes("@")) {
-				const session = this.$sessionSelect.val() || null;
 				frappe.call({
 					method: "whatsapp_integration.api.chat.load_whatsapp_messages",
 					args: { session, jid, limit: PAGE_SIZE },
@@ -452,21 +695,18 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 							this.render_messages(messages, resetCursor);
 							this.$loadMoreBtn.prop("disabled", messages.length < PAGE_SIZE);
 						} else {
-							// Fallback to database
-							this.load_thread_from_db(number, resetCursor);
+							this.load_thread_from_db(number || this.currentNumber, resetCursor);
 						}
-						this.$headerSession.text(
-							this.$sessionSelect.find("option:selected").text() || __("Auto")
-						);
 					},
 					always: () => {
 						this.isLoadingHistory = false;
 					},
 				});
-			} else {
-				// Load from database
-				this.load_thread_from_db(number, resetCursor);
+				return;
 			}
+
+			// Load from database
+			this.load_thread_from_db(number || this.currentNumber, resetCursor);
 		}
 
 		load_thread_from_db(number, resetCursor) {
@@ -504,12 +744,20 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 				this.$history.empty();
 			}
 
+			this.isRenderingBatch = true;
 			if (reset) {
 				messages.forEach((msg) => this.append_message(msg, false, false));
 			} else {
 				for (let idx = messages.length - 1; idx >= 0; idx--) {
 					this.append_message(messages[idx], false, true);
 				}
+			}
+			this.isRenderingBatch = false;
+
+			if (reset) {
+				this.currentMessages = messages.slice();
+			} else {
+				this.currentMessages = [...messages, ...(this.currentMessages || [])];
 			}
 
 			if (reset) {
@@ -543,6 +791,17 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 				this.$history.prepend(container);
 			} else {
 				this.$history.append(container);
+			}
+
+			if (!this.isRenderingBatch) {
+				if (!Array.isArray(this.currentMessages)) {
+					this.currentMessages = [];
+				}
+				if (prepend) {
+					this.currentMessages.unshift(msg);
+				} else {
+					this.currentMessages.push(msg);
+				}
 			}
 
 			if (scroll) this.scroll_to_bottom();

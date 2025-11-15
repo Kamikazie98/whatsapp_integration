@@ -1,6 +1,7 @@
 import frappe
 from frappe import _
 from frappe.utils import now
+from urllib.parse import urlparse
 
 from whatsapp_integration.api.utils import mark_device_active, resolve_device_name, find_party_by_number
 from whatsapp_integration.api.whatsapp_unofficial import send_unofficial
@@ -322,4 +323,37 @@ def load_whatsapp_messages(session=None, jid=None, limit=50):
         return data
     except Exception as e:
         frappe.log_error(f"Failed to load WhatsApp messages: {str(e)}", "WhatsApp Load Messages")
-        frappe.throw(_("Failed to load messages from WhatsApp: {0}").format(str(e)))
+        frappe.throw(_("Failed to load messages from WhatsApp: {error}").format(error=str(e)))
+
+
+@frappe.whitelist()
+def get_websocket_url():
+    """Return the WebSocket endpoint exposed by the Node service for live chats."""
+    _ensure_unofficial_mode()
+    
+    from whatsapp_integration.api.whatsapp_unofficial import _get_node_base_url
+    
+    base = _get_node_base_url()
+    parsed = urlparse(base)
+    scheme = parsed.scheme or "http"
+    netloc = parsed.netloc or parsed.path
+    if not netloc:
+        frappe.throw(_("Invalid Node service URL"))
+    ws_scheme = "wss" if scheme == "https" else "ws"
+    base_path = parsed.path.rstrip("/")
+    suffix = f"{base_path}/ws/chat" if base_path else "/ws/chat"
+    return {"url": f"{ws_scheme}://{netloc}{suffix}"}
+
+
+@frappe.whitelist()
+def resolve_node_session(session=None):
+    """Return the Node.js session identifier for a selected WhatsApp device."""
+    _ensure_unofficial_mode()
+
+    session_value = (session or "").strip() or None
+    device_name = resolve_device_name(session_value)
+    if device_name:
+        resolved = frappe.db.get_value("WhatsApp Device", device_name, "number") or session_value or device_name
+    else:
+        resolved = session_value or "default"
+    return {"session": resolved, "device": device_name}
