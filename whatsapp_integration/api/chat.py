@@ -330,25 +330,9 @@ def load_whatsapp_messages(session=None, jid=None, limit=50):
 def get_websocket_url():
     """Return the WebSocket endpoint exposed by the Node service for live chats."""
     _ensure_unofficial_mode()
-    
-    from whatsapp_integration.api.whatsapp_unofficial import _get_node_base_url
-    
-    base = _get_node_base_url()
-    parsed = urlparse(base)
-    # Prefer secure websocket when either Node service uses HTTPS or the current site is served over HTTPS.
-    is_secure_request = False
-    request = getattr(frappe.local, "request", None)
-    if request:
-        is_secure_request = getattr(request, "scheme", "").lower() == "https"
-    if not is_secure_request:
-        try:
-            is_secure_request = frappe.utils.get_url().lower().startswith("https://")
-        except Exception:
-            is_secure_request = False
-    ws_scheme = "wss" if (parsed.scheme or "").lower() == "https" or is_secure_request else "ws"
-    hostname = "erp.clickapps.ir"
-    return {"url": f"{ws_scheme}://{hostname}/ws/chat"}
 
+    # فقط path رو بده، hostname و scheme رو بذار به عهده‌ی فرانت
+    return {"url": "/ws/chat"}
 
 @frappe.whitelist()
 def resolve_node_session(session=None):

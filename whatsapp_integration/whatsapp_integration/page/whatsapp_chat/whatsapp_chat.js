@@ -216,17 +216,42 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 		}
 
 		setup_live_bridge() {
-			frappe.call({
-				method: "whatsapp_integration.api.chat.get_websocket_url",
-				callback: (r) => {
-					const url = r.message && r.message.url;
-					if (url) {
-						this.wsUrl = url;
-						this.connect_websocket();
-					}
-				},
-			});
-		}
+    frappe.call({
+        method: "whatsapp_integration.api.chat.get_websocket_url",
+        callback: (r) => {
+            let raw = r.message && r.message.url;
+
+            // اگر سرور چیزی نداد، دیفالت بگذار
+            if (!raw) {
+                raw = "/ws/chat";
+            }
+
+            // بر اساس پروتکل صفحه ws یا wss انتخاب کن
+            const proto = window.location.protocol === "https:" ? "wss" : "ws";
+            let finalUrl;
+
+            if (raw.startsWith("ws://") || raw.startsWith("wss://")) {
+                // اگر سرور فول URL داد، فقط scheme رو با پروتکل فعلی هماهنگ کن
+                try {
+                    const u = new URL(raw);
+                    finalUrl = `${proto}://${u.host}${u.pathname}${u.search}`;
+                } catch (e) {
+                    finalUrl = `${proto}://${window.location.host}/ws/chat`;
+                }
+            } else if (raw.startsWith("/")) {
+                // اگر فقط path بود
+                finalUrl = `${proto}://${window.location.host}${raw}`;
+            } else {
+                // هر چیز عجیب → برگردیم به دیفالت امن
+                finalUrl = `${proto}://${window.location.host}/ws/chat`;
+            }
+
+            this.wsUrl = finalUrl;
+            this.connect_websocket();
+        },
+    });
+}
+
 
 		connect_websocket() {
 			if (!this.wsUrl) return;
