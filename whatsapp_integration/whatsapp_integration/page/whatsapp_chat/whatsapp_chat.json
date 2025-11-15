@@ -1,0 +1,17 @@
+{
+ "doctype": "Page",
+ "name": "whatsapp-chat",
+ "module": "Whatsapp Integration",
+ "title": "WhatsApp Chat",
+ "content": "",
+ "icon": "fa fa-comments",
+ "single_column": 1,
+ "roles": [
+  {
+   "role": "System Manager"
+  },
+  {
+   "role": "Sales User"
+  }
+ ]
+}

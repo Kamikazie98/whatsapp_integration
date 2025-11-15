@@ -2,6 +2,7 @@ import frappe
 from frappe.utils.background_jobs import enqueue
 from frappe.utils import now_datetime, getdate, nowdate, add_days
 from datetime import datetime, timedelta
+from whatsapp_integration.api.utils import resolve_device_name
 
 MAX_RETRY_ATTEMPTS = 3
 
@@ -45,9 +46,18 @@ def process_campaign(campaign_id):
     for idx, row in enumerate(campaign.recipients):
         try:
             from whatsapp_integration.api.whatsapp import send_whatsapp_message
-            send_whatsapp_message(row.number, campaign.message_template)
+            session_for_row = row.device or campaign.device
+            response = send_whatsapp_message(
+                row.number,
+                campaign.message_template,
+                session=session_for_row
+            )
+            session_used = response.get("session") if isinstance(response, dict) else None
+            resolved_device = resolve_device_name(session_used) if session_used else None
             row.status = "Sent"
             row.sent_time = frappe.utils.now()
+            if resolved_device:
+                row.device = resolved_device
             campaign.sent_count += 1
         except Exception as e:
             row.status = "Failed"
@@ -97,6 +107,8 @@ def load_recipients(campaign_id, source, filter_by=None):
     # Clear old recipients and add new ones
     campaign.set("recipients", [])
     for r in recipients:
+        if campaign.device:
+            r["device"] = campaign.device
         campaign.append("recipients", r)
     
     campaign.save()
@@ -174,7 +186,7 @@ def auto_retry_failed():
     recipients = frappe.get_all(
         "WhatsApp Campaign Recipient",
         filters={"status": "Failed"},
-        fields=["name", "number", "message", "parent", "retry_count"]
+        fields=["name", "number", "message", "parent", "retry_count", "device"]
     )
 
     retried = 0
@@ -186,7 +198,7 @@ def auto_retry_failed():
 
         try:
             from whatsapp_integration.api.whatsapp import send_whatsapp_message
-            send_whatsapp_message(rec.number, rec.message)
+            send_whatsapp_message(rec.number, rec.message, session=rec.device)
             frappe.db.set_value("WhatsApp Campaign Recipient", rec.name, {
                 "status": "Retrying",
                 "retry_count": (rec.retry_count or 0) + 1,
@@ -213,7 +225,7 @@ def bulk_retry(date=None, campaign=None):
         params.append(campaign)
 
     query = f"""
-        SELECT name, number, message, parent
+        SELECT name, number, message, parent, device
         FROM `tabWhatsApp Campaign Recipient`
         WHERE {" AND ".join(conditions)}
     """
@@ -223,7 +235,7 @@ def bulk_retry(date=None, campaign=None):
     retried = 0
 
     for rec in failed_recipients:
-        send_whatsapp_message(rec.number, rec.message)
+        send_whatsapp_message(rec.number, rec.message, session=rec.device)
         frappe.db.set_value("WhatsApp Campaign Recipient", rec.name, "status", "Retrying")
         retried += 1
 
@@ -238,7 +250,7 @@ def retry_recipient(recipient_id):
         frappe.throw("Only failed messages can be retried.")
 
     from whatsapp_integration.api.whatsapp import send_whatsapp_message
-    send_whatsapp_message(rec.number, rec.message)
+    send_whatsapp_message(rec.number, rec.message, session=rec.device)
 
     rec.status = "Retrying"
     rec.save(ignore_permissions=True)

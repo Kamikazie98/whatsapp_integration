@@ -9,6 +9,7 @@
   "naming_series",
   "campaign_name",
   "message_template",
+  "device",
   "section_break_4",
   "recipients_source",
   "filter_by",
@@ -55,6 +56,13 @@
    "fieldtype": "Text Editor",
    "label": "Message Template",
    "reqd": 1
+  },
+  {
+   "description": "Select which WhatsApp Device/session should send this campaign. Leave blank to auto-pick any connected session.",
+   "fieldname": "device",
+   "fieldtype": "Link",
+   "label": "WhatsApp Device / Session",
+   "options": "WhatsApp Device"
   },
   {
    "fieldname": "section_break_4",

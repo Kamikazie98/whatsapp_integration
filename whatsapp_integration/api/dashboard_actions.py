@@ -1,5 +1,6 @@
 import frappe
 import requests
+from whatsapp_integration.api.whatsapp_unofficial import _get_node_base_url
 
 @frappe.whitelist()
 def add_device(session_name="default"):
@@ -8,24 +9,35 @@ def add_device(session_name="default"):
     if settings.mode != "Unofficial":
         return {"error": "Add Device works only in Unofficial mode"}
     
-    api_url = f"{settings.nodejs_url}/qr/{session_name}"
-    res = requests.get(api_url).json()
-    
-    # Save QR in device doc
-    device = frappe.get_doc({
-        "doctype": "WhatsApp Device",
-        "number": session_name,
-        "qr_code": res.get("qr"),
-        "status": "Disconnected"
-    })
-    device.insert(ignore_permissions=True)
-    return {"message": "Device added, scan QR in WhatsApp", "qr": res.get("qr")}
+    sanitized = (session_name or "default").strip() or "default"
+    base_url = _get_node_base_url()
+    res = requests.get(f"{base_url}/qr/{sanitized}", timeout=20)
+    res.raise_for_status()
+    payload = res.json()
+    qr_value = payload.get("qr")
+    status = "QR Generated" if qr_value else "Disconnected"
+
+    if frappe.db.exists("WhatsApp Device", sanitized):
+        device = frappe.get_doc("WhatsApp Device", sanitized)
+        device.qr_code = qr_value
+        device.status = status
+        device.save(ignore_permissions=True)
+    else:
+        device = frappe.get_doc({
+            "doctype": "WhatsApp Device",
+            "number": sanitized,
+            "qr_code": qr_value,
+            "status": status
+        })
+        device.insert(ignore_permissions=True)
+
+    return {"message": "Device added, scan QR in WhatsApp", "qr": qr_value, "session": sanitized}
 
 @frappe.whitelist()
-def send_test_message(number):
+def send_test_message(number, session=None):
     """Send test ping"""
     from whatsapp_integration.api.whatsapp import send_whatsapp_message
-    return send_whatsapp_message(number, "✅ WhatsApp Integration Test from ERPNext")
+    return send_whatsapp_message(number, "✅ WhatsApp Integration Test from ERPNext", session=session)
 
 @frappe.whitelist()
 def sync_now():

@@ -8,6 +8,7 @@
   "party_type",
   "party_name",
   "number",
+  "device",
   "message",
   "status",
   "sent_time",
@@ -35,6 +36,12 @@
    "in_list_view": 1,
    "label": "WhatsApp Number",
    "reqd": 1
+  },
+  {
+   "fieldname": "device",
+   "fieldtype": "Link",
+   "label": "Session / Device",
+   "options": "WhatsApp Device"
   },
   {
    "fieldname": "message",

@@ -14,4 +14,8 @@ export const sendMessage = impl.sendMessage;
 export const getSessionStatus = impl.getSessionStatus;
 export const listSessions = impl.listSessions ?? (() => []);
 export const resetSession = impl.resetSession ?? (() => ({ success: false, error: 'not_supported' }));
+export const getChats = impl.getChats ?? (() => Promise.reject(new Error('not_supported')));
+export const getContacts = impl.getContacts ?? (() => Promise.reject(new Error('not_supported')));
+export const getChatMessages = impl.getChatMessages ?? (() => Promise.reject(new Error('not_supported')));
+export const onRealtimeMessage = impl.onRealtimeMessage ?? (() => {});
 

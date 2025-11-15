@@ -10,14 +10,14 @@
     "auto-start": "./start.sh"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.4.0",
+    "baileys": "^6.7.21",
     "axios": "^1.4.0",
     "body-parser": "^1.20.0",
-    "whatsapp-web.js": "^1.23.0",
-    "puppeteer": "^22.8.0",
     "dotenv": "^17.2.1",
     "express": "^4.18.0",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.3",
+    "pino": "^10.1.0",
+    "ws": "^8.17.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"

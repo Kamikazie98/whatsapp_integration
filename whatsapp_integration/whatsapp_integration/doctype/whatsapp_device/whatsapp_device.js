@@ -360,7 +360,7 @@ function setup_auto_refresh(frm) {
     if (frm.auto_refresh_timer) {
         clearInterval(frm.auto_refresh_timer);
     }
-    
+
     frm.auto_refresh_timer = setInterval(function() {
         if (frm.doc.status === 'QR Generated') {
             // Pull latest QR and status via server (avoids CORS to Node)
