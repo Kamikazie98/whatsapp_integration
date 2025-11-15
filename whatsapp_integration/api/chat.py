@@ -272,7 +272,7 @@ def load_whatsapp_contacts(session=None):
         SELECT DISTINCT number, MAX(sent_time) as last_time
         FROM `tabWhatsApp Message Log`
         WHERE (device = %(device)s OR %(device)s IS NULL)
-        AND number NOT LIKE '%@g.us'
+        AND number NOT LIKE '%%@g.us'
         GROUP BY number
         ORDER BY last_time DESC
         LIMIT 200

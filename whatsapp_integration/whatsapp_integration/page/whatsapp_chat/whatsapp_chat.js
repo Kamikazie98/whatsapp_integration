@@ -254,82 +254,159 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
 }
 
 
-		connect_websocket() {
-			if (!this.wsUrl) return;
-			try {
-				if (this.ws) {
-					this.ws.close();
-				}
-				this.ws = new WebSocket(this.wsUrl);
-			} catch (err) {
-				console.warn("WhatsApp chat WebSocket failed:", err);
-				this.schedule_ws_reconnect();
-				return;
-			}
-			this.ws.onopen = () => {
-				this.wsReady = true;
-				const queued = this.wsQueue.splice(0);
-				queued.forEach((payload) => {
-					try {
-						this.ws.send(payload);
-					} catch (e) {
-						console.warn("Failed sending queued WS payload", e);
-					}
-				});
-				if (this.pendingSubscription) {
-					this.send_ws_command({ type: "subscribe", ...this.pendingSubscription });
-					this.pendingSubscription = null;
-				}
-			};
-			this.ws.onclose = () => {
-				this.wsReady = false;
-				this.schedule_ws_reconnect();
-			};
-			this.ws.onerror = () => {};
-			this.ws.onmessage = (event) => this.handle_ws_message(event);
-		}
+	connect_websocket() {
+    if (!this.wsUrl) {
+        console.warn("[WA-WS] wsUrl خالی است، کانکت نمی‌شوم");
+        return;
+    }
 
-		schedule_ws_reconnect() {
-			if (this.wsReconnectTimer || !this.wsUrl) return;
-			this.wsReconnectTimer = setTimeout(() => {
-				this.wsReconnectTimer = null;
-				this.connect_websocket();
-			}, 3000);
-		}
+    console.log("[WA-WS] تلاش برای اتصال به WebSocket:", this.wsUrl);
 
-		send_ws_command(payload) {
-			if (!this.ws) return;
-			const serialized = JSON.stringify(payload);
-			if (this.ws.readyState === WebSocket.OPEN) {
-				this.ws.send(serialized);
-			} else {
-				this.wsQueue.push(serialized);
-			}
-		}
+    try {
+        if (this.ws) {
+            console.log("[WA-WS] اتصال قبلی موجود است، بستن آن قبل از اتصال جدید");
+            this.ws.close();
+        }
+        this.ws = new WebSocket(this.wsUrl);
+    } catch (err) {
+        console.warn("[WA-WS] ساخت WebSocket شکست خورد:", err);
+        this.schedule_ws_reconnect();
+        return;
+    }
 
-		subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
-			if (!this.wsUrl) return;
-			const normalizedSession = session || "default";
-			const baseJid = (jid || "").toLowerCase();
-			const normalizedJid = baseJid.includes("@") ? baseJid : `${baseJid}@s.whatsapp.net`;
-			const key = `${normalizedSession}::${normalizedJid}`;
-			if (this.currentSubscriptionKey === key && !this.awaitingHistory) {
-				return;
-			}
-			if (this.currentSubscriptionKey && this.currentSubscriptionKey !== key && this.wsSessionId && this.wsJid) {
-				this.send_ws_command({
-					type: "unsubscribe",
-					session: this.wsSessionId,
-					jid: this.wsJid,
-				});
-			}
-			this.currentSubscriptionKey = key;
-			this.wsSessionId = normalizedSession;
-			this.wsJid = normalizedJid;
-			this.pendingSubscription = { session: normalizedSession, jid: normalizedJid, limit };
-			this.send_ws_command({ type: "subscribe", ...this.pendingSubscription });
-			this.pendingSubscription = null;
-		}
+    this.ws.onopen = () => {
+        console.log("[WA-WS] اتصال باز شد:", this.wsUrl);
+        this.wsReady = true;
+
+        const queued = this.wsQueue.splice(0);
+        if (queued.length) {
+            console.log("[WA-WS] ارسال", queued.length, "پیام در صف بعد از باز شدن اتصال");
+        }
+
+        queued.forEach((payload) => {
+            try {
+                this.ws.send(payload);
+            } catch (e) {
+                console.warn("[WA-WS] ارسال پیام صف‌شده شکست خورد:", e, "payload:", payload);
+            }
+        });
+
+        if (this.pendingSubscription) {
+            console.log("[WA-WS] ارسال subscribe معوق:", this.pendingSubscription);
+            this.send_ws_command({ type: "subscribe", ...this.pendingSubscription });
+            this.pendingSubscription = null;
+        }
+    };
+
+    this.ws.onclose = (event) => {
+        console.warn(
+            "[WA-WS] اتصال بسته شد. code:",
+            event.code,
+            "reason:",
+            event.reason || "-",
+            "wasClean:",
+            event.wasClean
+        );
+        this.wsReady = false;
+        this.schedule_ws_reconnect();
+    };
+
+    this.ws.onerror = (event) => {
+        console.error("[WA-WS] خطای WebSocket:", event);
+    };
+
+    this.ws.onmessage = (event) => {
+        console.log("[WA-WS] پیام دریافتی از WS:", event.data);
+        this.handle_ws_message(event);
+    };
+}
+
+schedule_ws_reconnect() {
+    if (this.wsReconnectTimer) {
+        console.log("[WA-WS] تایمر reconnect قبلاً تنظیم شده، انجام نمی‌دهم");
+        return;
+    }
+    if (!this.wsUrl) {
+        console.warn("[WA-WS] wsUrl خالی است، reconnect لغو شد");
+        return;
+    }
+    console.log("[WA-WS] زمان‌بندی reconnect برای ۳ ثانیه بعد…");
+    this.wsReconnectTimer = setTimeout(() => {
+        this.wsReconnectTimer = null;
+        console.log("[WA-WS] تلاش برای reconnect به", this.wsUrl);
+        this.connect_websocket();
+    }, 3000);
+}
+
+send_ws_command(payload) {
+    if (!this.ws) {
+        console.warn("[WA-WS] WebSocket تعریف نشده، نمی‌توانم payload ارسال کنم:", payload);
+        return;
+    }
+    const serialized = JSON.stringify(payload);
+    if (this.ws.readyState === WebSocket.OPEN) {
+        console.log("[WA-WS] ارسال فوری payload به WS:", payload);
+        this.ws.send(serialized);
+    } else {
+        console.log(
+            "[WA-WS] WS هنوز باز نیست (readyState:",
+            this.ws.readyState,
+            ")، اضافه کردن payload به صف:",
+            payload
+        );
+        this.wsQueue.push(serialized);
+    }
+}
+
+subscribe_realtime_chat(session, jid, limit = PAGE_SIZE) {
+    if (!this.wsUrl) {
+        console.warn("[WA-WS] wsUrl خالی است، نمی‌توانم subscribe کنم");
+        return;
+    }
+
+    const normalizedSession = session || "default";
+    const baseJid = (jid || "").toLowerCase();
+    const normalizedJid = baseJid.includes("@") ? baseJid : `${baseJid}@s.whatsapp.net`;
+    const key = `${normalizedSession}::${normalizedJid}`;
+
+    console.log("[WA-WS] درخواست subscribe", {
+        session,
+        jid,
+        normalizedSession,
+        normalizedJid,
+        key,
+        currentSubscriptionKey: this.currentSubscriptionKey,
+        awaitingHistory: this.awaitingHistory,
+    });
+
+    if (this.currentSubscriptionKey === key && !this.awaitingHistory) {
+        console.log("[WA-WS] قبلاً روی همین کلید subscribe شده‌ایم، کاری نمی‌کنم");
+        return;
+    }
+
+    if (this.currentSubscriptionKey && this.currentSubscriptionKey !== key && this.wsSessionId && this.wsJid) {
+        console.log("[WA-WS] unsubscribe از subscription قبلی", {
+            prevSession: this.wsSessionId,
+            prevJid: this.wsJid,
+        });
+        this.send_ws_command({
+            type: "unsubscribe",
+            session: this.wsSessionId,
+            jid: this.wsJid,
+        });
+    }
+
+    this.currentSubscriptionKey = key;
+    this.wsSessionId = normalizedSession;
+    this.wsJid = normalizedJid;
+    this.pendingSubscription = { session: normalizedSession, jid: normalizedJid, limit };
+
+    console.log("[WA-WS] ثبت pendingSubscription و ارسال subscribe:", this.pendingSubscription);
+
+    this.send_ws_command({ type: "subscribe", ...this.pendingSubscription });
+    this.pendingSubscription = null;
+}
+
 
 		unsubscribe_realtime_chat() {
 			if (!this.currentSubscriptionKey || !this.wsSessionId || !this.wsJid) {
