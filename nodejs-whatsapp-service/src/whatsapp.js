@@ -32,6 +32,105 @@ let qrCodes = {};
 const readySessions = new Set(); // sessions with established WhatsApp connection
 const starting = new Set(); // prevent concurrent startSession per sid
 const backoffUntil = new Map(); // sid -> timestamp ms when next attempt is allowed
+const messageHistory = new Map(); // sid -> Map<jid, message[]>
+const MAX_HISTORY_PER_CHAT = Number(process.env.WA_CHAT_HISTORY_LIMIT || 200);
+
+function normalizeChatJid(jid) {
+  if (!jid) return null;
+  const trimmed = String(jid).trim();
+  if (!trimmed) return null;
+  return trimmed.includes("@") ? trimmed.toLowerCase() : `${trimmed.toLowerCase()}@s.whatsapp.net`;
+}
+
+function canonicalChatJid(remoteJid, senderPn) {
+  const base = remoteJid && remoteJid.includes("@lid") && senderPn ? senderPn : remoteJid;
+  return normalizeChatJid(base);
+}
+
+function getSessionHistory(sid) {
+  if (!messageHistory.has(sid)) {
+    messageHistory.set(sid, new Map());
+  }
+  return messageHistory.get(sid);
+}
+
+function trimHistory(list) {
+  if (list.length > MAX_HISTORY_PER_CHAT) {
+    list.splice(0, list.length - MAX_HISTORY_PER_CHAT);
+  }
+  return list;
+}
+
+function extractMessageText(msg) {
+  const body = msg?.message || {};
+  return (
+    body.conversation ||
+    body.extendedTextMessage?.text ||
+    body.imageMessage?.caption ||
+    body.videoMessage?.caption ||
+    body.documentMessage?.caption ||
+    body.buttonsResponseMessage?.selectedDisplayText ||
+    body.listResponseMessage?.singleSelectReply?.selectedDisplayText ||
+    "Media message"
+  );
+}
+
+function rememberMessage(sid, msg) {
+  if (!msg?.message) return;
+  const canonical = canonicalChatJid(msg.key?.remoteJid, msg.key?.senderPn);
+  if (!canonical) return;
+  const historyMap = getSessionHistory(sid);
+  const history = historyMap.get(canonical) || [];
+  history.push(msg);
+  historyMap.set(canonical, trimHistory(history));
+}
+
+function safeTimestamp(msg) {
+  const ts = msg?.messageTimestamp;
+  if (typeof ts === "number") {
+    return new Date(ts * 1000).toISOString();
+  }
+  if (typeof ts === "string" && ts) {
+    const parsed = parseInt(ts, 10);
+    if (!Number.isNaN(parsed)) {
+      return new Date(parsed * 1000).toISOString();
+    }
+  }
+  const ms = msg?.message?.messageContextInfo?.messageSecretTimestampMs;
+  if (ms) {
+    return new Date(Number(ms)).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function extractNumber(raw) {
+  return (raw || "").replace(/@.+$/, "");
+}
+
+function resolveSenderNumber(msg, chatJid, fromMe) {
+  if (fromMe) {
+    return extractNumber(chatJid);
+  }
+  if ((chatJid || "").endsWith("@g.us")) {
+    return extractNumber(msg?.key?.participant || msg?.participant || msg?.key?.senderPn);
+  }
+  if ((chatJid || "").endsWith("@lid")) {
+    return extractNumber(msg?.key?.senderPn || chatJid);
+  }
+  return extractNumber(msg?.key?.senderPn || chatJid);
+}
+
+function formatHistoryMessage(msg, requestedJid) {
+  const chatJid = canonicalChatJid(msg.key?.remoteJid, msg.key?.senderPn) || requestedJid;
+  return {
+    id: msg?.key?.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    from: resolveSenderNumber(msg, chatJid, Boolean(msg?.key?.fromMe)),
+    fromMe: Boolean(msg?.key?.fromMe),
+    message: extractMessageText(msg),
+    timestamp: safeTimestamp(msg),
+    status: msg?.status || (msg?.key?.fromMe ? "sent" : "received"),
+  };
+}
 
 export async function getQR(sessionId) {
   const sid = normalizeSessionId(sessionId);
@@ -128,6 +227,7 @@ export async function startSession(sessionId) {
         }
         // Always drop the in-memory session handle so restart can proceed
         delete sessions[sid];
+        messageHistory.delete(sid);
         if (!removed) {
           setTimeout(() => startSession(sid), 1500);
         } else {
@@ -146,30 +246,36 @@ export async function startSession(sessionId) {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("messages.upsert", async (m) => {
-      const msg = m.messages[0];
-      if (!msg.key.fromMe && msg.message) {
-        try {
-          const messageText =
-            msg.message.conversation ||
-            msg.message.extendedTextMessage?.text ||
-            "Media message";
+      const incoming = m.messages || [];
+      for (const msg of incoming) {
+        rememberMessage(sid, msg);
+        if (!msg.key?.fromMe && msg.message) {
+          try {
+            const messageText = extractMessageText(msg);
+            const senderJid =
+              msg.key?.senderPn ||
+              msg.key?.participant ||
+              msg.key?.remoteJid ||
+              "";
 
-          await axios.post(config.erpnext_webhook, {
-            session: sid,
-            from: msg.key.remoteJid.replace("@s.whatsapp.net", ""),
-            text: messageText,
-            timestamp: new Date().toISOString(),
-          });
+            await axios.post(config.erpnext_webhook, {
+              session: sid,
+              from: senderJid.replace("@s.whatsapp.net", "").replace("@lid", ""),
+              text: messageText,
+              timestamp: new Date().toISOString(),
+            });
 
-          console.log(
-            `Forwarded message from ${msg.key.remoteJid} to ERPNext`
-          );
-        } catch (error) {
-          console.error("Failed to forward message to ERPNext:", error.message);
+            console.log(
+              `Forwarded message from ${msg.key.remoteJid} to ERPNext`
+            );
+          } catch (error) {
+            console.error("Failed to forward message to ERPNext:", error.message);
+          }
         }
       }
     });
 
+    messageHistory.set(sid, new Map());
     sessions[sid] = sock;
     console.log(`Session ${sid} started successfully`);
     return "Session started";
@@ -259,6 +365,7 @@ export function resetSession(sessionId) {
     delete sessions[sid];
     delete qrCodes[sid];
     readySessions.delete(sid);
+    messageHistory.delete(sid);
     return { success: true };
   } catch (e) {
     return { success: false, error: String(e) };
@@ -360,48 +467,25 @@ export async function getChatMessages(sessionId, jid, limit = 50) {
   if (!readySessions.has(sid)) {
     throw new Error("Session is not connected yet.");
   }
-  
+
   try {
-    const normalizedJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`;
-    
-    // Baileys uses fetchMessagesFromWA for getting message history
-    // Note: This may not work for all cases - WhatsApp Web limits message history access
-    let messages = [];
-    try {
-      messages = await sock.fetchMessagesFromWA(normalizedJid, limit);
-    } catch (err) {
-      console.warn(`fetchMessagesFromWA failed for ${normalizedJid}:`, err.message);
-      // Return empty messages - suggest using database history instead
-      return { 
-        success: true, 
+    const normalizedJid = normalizeChatJid(jid);
+    if (!normalizedJid) {
+      throw new Error("Chat ID (JID) is required.");
+    }
+    const sessionStore = messageHistory.get(sid);
+    const history = sessionStore?.get(normalizedJid) || [];
+    const cappedLimit = Math.max(1, Math.min(Number(limit) || 50, MAX_HISTORY_PER_CHAT));
+    const recent = history.slice(-cappedLimit);
+    const formatted = recent.map((msg) => formatHistoryMessage(msg, normalizedJid));
+    if (!formatted.length) {
+      return {
+        success: false,
         messages: [],
-        note: "Unable to fetch messages from WhatsApp. Use database message history instead."
+        note: "No in-memory chat history. Falling back to ERPNext logs.",
       };
     }
-    
-    const formattedMessages = messages.map((msg) => {
-      const remoteJid = msg.key.remoteJid || normalizedJid;
-      const from = remoteJid.includes('@g.us') 
-        ? (msg.key.participant?.replace('@s.whatsapp.net', '') || remoteJid.replace('@g.us', ''))
-        : remoteJid.replace('@s.whatsapp.net', '');
-      
-      return {
-        id: msg.key.id,
-        from: from,
-        fromMe: msg.key.fromMe || false,
-        message: msg.message?.conversation || 
-                 msg.message?.extendedTextMessage?.text || 
-                 msg.message?.imageMessage?.caption ||
-                 msg.message?.videoMessage?.caption ||
-                 'Media message',
-        timestamp: msg.messageTimestamp 
-          ? new Date(msg.messageTimestamp * 1000).toISOString()
-          : new Date().toISOString(),
-        status: msg.status || (msg.key.fromMe ? 'sent' : 'received'),
-      };
-    });
-    
-    return { success: true, messages: formattedMessages };
+    return { success: true, messages: formatted };
   } catch (error) {
     console.error(`Failed to get messages for ${sid}/${jid}:`, error);
     throw new Error(`Failed to get messages: ${error.message || String(error)}`);
