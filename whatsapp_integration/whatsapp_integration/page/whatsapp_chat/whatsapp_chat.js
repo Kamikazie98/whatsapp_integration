@@ -247,6 +247,7 @@ frappe.pages["whatsapp-chat"].on_page_load = function (wrapper) {
             }
 
             this.wsUrl = finalUrl;
+			console.log(finalUrl)
             this.connect_websocket();
         },
     });
