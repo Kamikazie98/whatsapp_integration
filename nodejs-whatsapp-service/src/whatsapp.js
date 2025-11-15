@@ -258,12 +258,16 @@ export async function startSession(sessionId) {
               msg.key?.remoteJid ||
               "";
 
-            await axios.post(config.erpnext_webhook, {
-              session: sid,
-              from: senderJid.replace("@s.whatsapp.net", "").replace("@lid", ""),
-              text: messageText,
-              timestamp: new Date().toISOString(),
-            });
+            await axios.post(
+              config.erpnext_webhook,
+              {
+                session: sid,
+                from: senderJid.replace("@s.whatsapp.net", "").replace("@lid", ""),
+                text: messageText,
+                timestamp: new Date().toISOString(),
+              },
+              { headers: config.webhook_headers }
+            );
 
             console.log(
               `Forwarded message from ${msg.key.remoteJid} to ERPNext`
